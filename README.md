@@ -1,6 +1,6 @@
-# O2 Cloud Drive Prototype
+# O2 Cloud Drive
 
-Prototipo Windows en C#/.NET 8 que monta una unidad virtual con WinFsp. El modo normal inicia sesion en O2 Cloud, lista carpetas y archivos reales y permite abrir archivos mediante descarga bajo demanda. El backend simulado queda disponible con `--skip-auth` o `--simulated`.
+Aplicacion Windows en C#/.NET 8 que monta O2 Cloud como una unidad virtual con WinFsp. El modo normal inicia sesion en O2 Cloud, lista carpetas y archivos reales y permite abrir archivos mediante descarga bajo demanda. El backend simulado queda disponible con `--skip-auth` o `--simulated`.
 
 ## Objetivo de esta fase
 
@@ -45,7 +45,6 @@ El proyecto usa el paquete NuGet `winfsp.net`, pero el driver de WinFsp debe est
 ## Compilar
 
 ```powershell
-cd C:\Users\CASA\Documents\Playground\o2-cloud-drive
 dotnet restore
 dotnet build -c Release
 ```
@@ -61,7 +60,6 @@ Si la maquina solo tiene un SDK anterior, instala .NET 8 o usa el SDK local:
 El instalador completo se genera con:
 
 ```powershell
-cd C:\Users\CASA\Documents\Playground\o2-cloud-drive
 .\installer\build-installer.ps1
 ```
 
@@ -76,10 +74,10 @@ El script descarga los prerrequisitos oficiales si no estan ya en `installer\pre
 
 ## Ejecutar la aplicacion Windows
 
-Despues de compilar, abre:
+Despues de compilar, abre el ejecutable publicado por .NET:
 
 ```powershell
-C:\Users\CASA\Documents\Playground\o2-cloud-drive\src\O2CloudDrive\bin\Release\net8.0-windows\win-x64\O2CloudDrive.exe
+.\src\O2CloudDrive\bin\Release\net8.0-windows\win-x64\O2CloudDrive.exe
 ```
 
 La ventana permite:
