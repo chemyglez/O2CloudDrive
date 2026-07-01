@@ -111,7 +111,7 @@ Para una prueba automatizada de montaje:
 .\.dotnet\dotnet.exe run --project .\src\O2CloudDrive\O2CloudDrive.csproj -c Release -- --mount O: --skip-auth --run-for-seconds 15
 ```
 
-El modo normal de usuario ya no requiere consola: abre el `.exe` y pulsa `Login nuevo` o `Montar`. La app comprueba Windows Credential Manager. Si no hay sesion valida, abre una ventana WebView2 con el login oficial de O2 Cloud. Introduce telefono, contrasena y SMS ahi. Cuando la sesion valida, se guarda en Credential Manager y se monta la unidad elegida con datos reales.
+El modo normal de usuario ya no requiere consola: abre el `.exe` y pulsa `Login nuevo` o `Montar`. La app comprueba Windows Credential Manager. Si no hay sesion valida, abre una ventana WebView2 con el login oficial de O2 Cloud. Introduce telefono, contraseña y SMS ahi. Cuando la sesion valida, se guarda en Credential Manager y se monta la unidad elegida con datos reales.
 
 El backend real permite crear carpetas, crear/subir archivos, renombrar, mover y enviar archivos o carpetas a la papelera. La escritura de archivos se confirma al cerrar o vaciar el manejador (`Flush/Cleanup` de WinFsp). Para el prototipo, la edicion de un archivo remoto existente descarga primero el archivo completo en memoria y esta limitada a 512 MB por operacion; la lectura normal sigue usando descargas parciales con `Range`.
 
