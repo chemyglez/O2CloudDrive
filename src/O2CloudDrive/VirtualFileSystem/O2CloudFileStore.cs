@@ -8,6 +8,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
     private const ulong MaxEditableFileBytes = 3_900_000_000UL;
     private const string TrashNodeId = "virtual:o2-trash";
     private const string TrashNodeName = "Papelera";
+    private static readonly TimeSpan RemoteChangesCheckInterval = TimeSpan.FromSeconds(15);
     private static readonly string BaseWriteCacheDirectory = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "O2CloudDrive",
@@ -20,6 +21,8 @@ public sealed class O2CloudFileStore : ICloudFileStore
     private readonly string _localContentDirectory;
     private ulong _nextIndex = 1;
     private CloudVolumeInfo _lastVolume = DefaultVolume;
+    private long _remoteChangesCursor = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+    private DateTimeOffset _nextRemoteChangesCheckAt = DateTimeOffset.UtcNow.Add(RemoteChangesCheckInterval);
 
     public O2CloudFileStore(IO2CloudApiClient apiClient)
     {
@@ -62,6 +65,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
     {
         lock (_gate)
         {
+            RefreshForRemoteChangesIfNeeded();
             return TryFindByPath(path, out node!);
         }
     }
@@ -121,6 +125,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
             if (kind == CloudItemKind.Directory)
             {
                 var created = _apiClient.CreateFolder(parent.Id, name);
+                MarkRemoteChangeHandled();
                 var nodeName = UniqueName(SanitizeName(created.Name), created.Id, parent.Children.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase));
                 var node = NewNode(created.Id, nodeName, CloudItemKind.Directory, parent);
                 ApplyMetadata(node, created);
@@ -182,6 +187,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
                 {
                     _apiClient.MoveToTrash(ToDto(node));
                 }
+                MarkRemoteChangeHandled();
             }
 
             node.Parent.Children.Remove(node.Name);
@@ -207,7 +213,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
             var normalized = PathTools.Normalize(newPath);
             var newParent = GetRequiredParent(normalized);
             EnsureChildrenLoaded(newParent);
-            if (node.IsVirtualTrashRoot || node.IsTrashItem || newParent.IsVirtualTrashRoot || newParent.IsTrashItem)
+            if (node.IsVirtualTrashRoot || newParent.IsVirtualTrashRoot || newParent.IsTrashItem)
             {
                 throw new UnauthorizedAccessException("La papelera no admite renombrar o mover elementos.");
             }
@@ -235,9 +241,33 @@ public sealed class O2CloudFileStore : ICloudFileStore
                 Delete(existing);
             }
 
+            if (node.IsTrashItem)
+            {
+                var restored = _apiClient.RestoreFromTrash(ToDto(node));
+                var restoredDto = restored with { Name = newName, ParentId = newParent.Id };
+                _apiClient.RenameOrMove(restoredDto, newName, newParent.Id);
+
+                oldParent.Children.Remove(node.Name);
+                node.Parent = newParent;
+                node.Name = newName;
+                node.IsTrashItem = false;
+                ApplyMetadata(node, restoredDto);
+                newParent.Children[newName] = node;
+                MarkRemoteChangeHandled();
+                Touch(node, updateWriteTime: false);
+                Touch(oldParent, updateWriteTime: true);
+                if (!ReferenceEquals(oldParent, newParent))
+                {
+                    Touch(newParent, updateWriteTime: true);
+                }
+
+                return;
+            }
+
             if (!node.IsNew)
             {
                 _apiClient.RenameOrMove(ToDto(node), newName, newParent.Id);
+                MarkRemoteChangeHandled();
             }
 
             oldParent.Children.Remove(node.Name);
@@ -466,6 +496,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
                 node.HighestWrittenOffset = 0;
                 node.IsDirty = false;
                 node.IsNew = false;
+                MarkRemoteChangeHandled();
             }
         }
         catch
@@ -494,9 +525,14 @@ public sealed class O2CloudFileStore : ICloudFileStore
     private void EnsureChildrenLoaded(CloudNode directory)
     {
         EnsureDirectory(directory);
+        RefreshForRemoteChangesIfNeeded();
         if (directory.IsVirtualTrashRoot)
         {
-            LoadTrashChildren(directory);
+            if (!directory.ChildrenLoaded)
+            {
+                LoadTrashChildren(directory);
+            }
+
             return;
         }
 
@@ -532,6 +568,64 @@ public sealed class O2CloudFileStore : ICloudFileStore
         }
 
         directory.ChildrenLoaded = true;
+    }
+
+    private void RefreshForRemoteChangesIfNeeded()
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (now < _nextRemoteChangesCheckAt)
+        {
+            return;
+        }
+
+        _nextRemoteChangesCheckAt = now.Add(RemoteChangesCheckInterval);
+        if (HasActiveLocalChanges(Root))
+        {
+            return;
+        }
+
+        try
+        {
+            var changes = _apiClient.GetChangesSince(_remoteChangesCursor);
+            _remoteChangesCursor = Math.Max(_remoteChangesCursor, changes.NextCursor);
+            if (changes.HasChanges)
+            {
+                InvalidateLoadedChildren(Root);
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    private void MarkRemoteChangeHandled()
+    {
+        _remoteChangesCursor = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        _nextRemoteChangesCheckAt = DateTimeOffset.UtcNow.Add(RemoteChangesCheckInterval);
+    }
+
+    private static bool HasActiveLocalChanges(CloudNode node)
+    {
+        if (node.IsDirty || node.IsNew || node.UploadInProgress || node.UploadPendingRemoteConfirmation)
+        {
+            return true;
+        }
+
+        return node.Children.Values.Any(HasActiveLocalChanges);
+    }
+
+    private static void InvalidateLoadedChildren(CloudNode node)
+    {
+        foreach (var child in node.Children.Values.ToList())
+        {
+            InvalidateLoadedChildren(child);
+        }
+
+        if (node.IsDirectory)
+        {
+            node.Children.Clear();
+            node.ChildrenLoaded = false;
+        }
     }
 
     private void AddTrashRoot(CloudNode root, ISet<string> usedNames)

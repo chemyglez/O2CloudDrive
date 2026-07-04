@@ -1,11 +1,17 @@
 param(
-    [switch]$SkipPublish
+    [switch]$SkipPublish,
+    [switch]$SkipSigning,
+    [string]$SignToolPath,
+    [string]$CertificateThumbprint,
+    [string]$CertificatePath,
+    [string]$CertificatePasswordEnv = "O2CLOUDDRIVE_PFX_PASSWORD",
+    [string]$TimestampServer = "http://timestamp.digicert.com"
 )
 
 $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $PSScriptRoot
-$PackageLabel = "0.5-beta"
+$PackageLabel = "0.7-beta"
 $PublishDir = Join-Path $Root "dist\O2CloudDrive-$PackageLabel-win-x64"
 $SetupProject = Join-Path $PSScriptRoot "O2CloudDrive.Setup\O2CloudDrive.Setup.csproj"
 $UninstallProject = Join-Path $PSScriptRoot "O2CloudDrive.Uninstall\O2CloudDrive.Uninstall.csproj"
@@ -24,6 +30,86 @@ if (-not (Test-Path -LiteralPath $Dotnet)) {
     $Dotnet = "dotnet"
 }
 
+function Test-CodeSigningEnabled {
+    return -not $SkipSigning -and (
+        -not [string]::IsNullOrWhiteSpace($CertificateThumbprint) -or
+        -not [string]::IsNullOrWhiteSpace($CertificatePath)
+    )
+}
+
+function Resolve-SignTool {
+    if (-not [string]::IsNullOrWhiteSpace($SignToolPath)) {
+        if (-not (Test-Path -LiteralPath $SignToolPath)) {
+            throw "No se encontro signtool.exe en $SignToolPath."
+        }
+
+        return $SignToolPath
+    }
+
+    $kitsRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\bin"
+    if (-not (Test-Path -LiteralPath $kitsRoot)) {
+        throw "No se encontro Windows SDK. Instala Windows SDK o indica -SignToolPath."
+    }
+
+    $tool = Get-ChildItem -LiteralPath $kitsRoot -Filter signtool.exe -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match "\\x64\\signtool\.exe$" } |
+        Sort-Object FullName -Descending |
+        Select-Object -First 1
+
+    if ($null -eq $tool) {
+        throw "No se encontro signtool.exe x64. Instala Windows SDK o indica -SignToolPath."
+    }
+
+    return $tool.FullName
+}
+
+function Invoke-CodeSign {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath
+    )
+
+    if (-not (Test-CodeSigningEnabled)) {
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath $FilePath)) {
+        throw "No se puede firmar porque no existe $FilePath."
+    }
+
+    $tool = Resolve-SignTool
+    $args = @("sign", "/fd", "SHA256", "/tr", $TimestampServer, "/td", "SHA256")
+    if (-not [string]::IsNullOrWhiteSpace($CertificateThumbprint)) {
+        $args += @("/sha", $CertificateThumbprint)
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($CertificatePath)) {
+        if (-not (Test-Path -LiteralPath $CertificatePath)) {
+            throw "No se encontro el certificado PFX en $CertificatePath."
+        }
+
+        $args += @("/f", $CertificatePath)
+        $password = [Environment]::GetEnvironmentVariable($CertificatePasswordEnv)
+        if (-not [string]::IsNullOrEmpty($password)) {
+            $args += @("/p", $password)
+        }
+    }
+
+    $args += $FilePath
+    & $tool @args
+    if ($LASTEXITCODE -ne 0) {
+        throw "Fallo la firma digital de $FilePath."
+    }
+
+    Write-Host "Firmado digitalmente: $FilePath"
+}
+
+if (Test-CodeSigningEnabled) {
+    Write-Host "Firma digital activada."
+}
+else {
+    Write-Host "Firma digital omitida: no se ha indicado certificado."
+}
+
 if (-not $SkipPublish) {
     & $Dotnet publish $Project -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:PublishReadyToRun=false -o $PublishDir
     if ($LASTEXITCODE -ne 0) {
@@ -34,6 +120,7 @@ if (-not $SkipPublish) {
 if (-not (Test-Path -LiteralPath (Join-Path $PublishDir "O2CloudDrive.exe"))) {
     throw "No se encontro la publicacion de O2CloudDrive en $PublishDir."
 }
+Invoke-CodeSign -FilePath (Join-Path $PublishDir "O2CloudDrive.exe")
 
 New-Item -ItemType Directory -Force -Path $Prereqs | Out-Null
 
@@ -70,6 +157,7 @@ $uninstallerExe = Join-Path $UninstallPublishDir "O2CloudDrive.Uninstall.exe"
 if (-not (Test-Path -LiteralPath $uninstallerExe)) {
     throw "No se encontro el ejecutable publicado del desinstalador."
 }
+Invoke-CodeSign -FilePath $uninstallerExe
 
 Remove-Item -LiteralPath $PayloadSource -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $PayloadSource | Out-Null
@@ -91,7 +179,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "dotnet publish del instalador fallo."
 }
 
-$publishedSetupExe = Join-Path $SetupPublishDir "O2CloudDrive-0.5-beta-Setup.exe"
+$publishedSetupExe = Join-Path $SetupPublishDir "O2CloudDrive-0.7-beta-Setup.exe"
 if (-not (Test-Path -LiteralPath $publishedSetupExe)) {
     throw "No se encontro el ejecutable publicado del instalador."
 }
@@ -99,6 +187,7 @@ if (-not (Test-Path -LiteralPath $publishedSetupExe)) {
 Remove-Item -LiteralPath $SetupExe -Force -ErrorAction SilentlyContinue
 Copy-Item -LiteralPath $publishedSetupExe -Destination $SetupExe -Force
 Remove-Item -LiteralPath $publishedSetupExe -Force -ErrorAction SilentlyContinue
+Invoke-CodeSign -FilePath $SetupExe
 
 $hash = Get-FileHash -LiteralPath $SetupExe -Algorithm SHA256
 Set-Content -LiteralPath $HashFile -Value "$($hash.Hash)  $(Split-Path -Leaf $SetupExe)" -Encoding ASCII

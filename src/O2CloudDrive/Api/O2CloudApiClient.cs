@@ -12,6 +12,7 @@ public interface IO2CloudApiClient
 {
     O2CloudItemDto GetRootFolder();
     O2StorageInfo GetStorageInfo();
+    O2ChangeSummary GetChangesSince(long from);
     IReadOnlyList<O2CloudItemDto> ListFolder(string folderId);
     IReadOnlyList<O2CloudItemDto> ListTrash();
     byte[] DownloadFile(O2CloudItemDto item, ulong offset, uint length);
@@ -21,6 +22,7 @@ public interface IO2CloudApiClient
     O2CloudItemDto UploadFile(string parentFolderId, string name, Stream content, long contentLength);
     void RenameOrMove(O2CloudItemDto item, string newName, string parentFolderId);
     void MoveToTrash(O2CloudItemDto item);
+    O2CloudItemDto RestoreFromTrash(O2CloudItemDto item);
     void PermanentlyDelete(O2CloudItemDto item);
 }
 
@@ -168,6 +170,23 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             UsedBytes: Math.Max(0, used),
             TotalBytes: Math.Max(0, total.Value),
             FreeBytes: Math.Max(0, freeBytes));
+    }
+
+    public O2ChangeSummary GetChangesSince(long from)
+    {
+        using var document = SendJson(HttpMethod.Get, "profile/changes", new Dictionary<string, string?>
+        {
+            ["action"] = "get",
+            ["from"] = Math.Max(0, from).ToString(CultureInfo.InvariantCulture),
+            ["locked"] = "false",
+            ["origin"] = "omh,dropbox",
+        });
+
+        var root = document.RootElement;
+        var data = ObjectProperty(root, "data");
+        var nextCursor = FirstLong(root, "requesttime", "responsetime") ??
+                         DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        return new O2ChangeSummary(HasMeaningfulChanges(data), nextCursor);
     }
 
     public IReadOnlyList<O2CloudItemDto> ListFolder(string folderId)
@@ -360,9 +379,59 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
     {
         if (item.IsFolder)
         {
-            throw new InvalidOperationException("Solo se pueden compartir archivos.");
+            var existing = TryGetExistingFolderShareLink(item);
+            if (!string.IsNullOrWhiteSpace(existing))
+            {
+                return NormalizeShareLink(existing!);
+            }
+
+            using var folderDocument = FirstSuccess(
+                () => SendFormJson(HttpMethod.Post, "link/folder", new Dictionary<string, string?>
+                {
+                    ["action"] = "save",
+                }, new
+                {
+                    data = new
+                    {
+                        folderid = O2Id(item.Id),
+                    },
+                }) ?? throw new InvalidOperationException("O2 Cloud no devolvio respuesta al compartir la carpeta."),
+                () => SendJson(HttpMethod.Post, "link/folder", new Dictionary<string, string?>
+                {
+                    ["action"] = "save",
+                }, new
+                {
+                    data = new
+                    {
+                        folderid = O2Id(item.Id),
+                    },
+                }));
+
+            if (folderDocument is null)
+            {
+                throw new InvalidOperationException("O2 Cloud no devolvio respuesta al compartir la carpeta.");
+            }
+
+            var folderShareUrl = ShareUrlFrom(folderDocument.RootElement);
+            if (string.IsNullOrWhiteSpace(folderShareUrl))
+            {
+                throw new InvalidOperationException("O2 Cloud no devolvio el enlace compartido de la carpeta.");
+            }
+
+            return NormalizeShareLink(folderShareUrl);
         }
 
+        var fileExisting = TryGetExistingFileShareLink(item);
+        if (!string.IsNullOrWhiteSpace(fileExisting))
+        {
+            return NormalizeShareLink(fileExisting!);
+        }
+
+        return CreateMediaSetShareLink(item);
+    }
+
+    private string CreateMediaSetShareLink(O2CloudItemDto item)
+    {
         using var document = SendJson(
             HttpMethod.Post,
             "media/set",
@@ -389,6 +458,89 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         }
 
         return NormalizeShareLink(shareUrl);
+    }
+
+    private string? TryGetExistingFileShareLink(O2CloudItemDto item)
+    {
+        var singleIdPayload = new
+        {
+            data = new
+            {
+                ids = O2Id(item.Id),
+            },
+        };
+        var arrayIdPayload = new
+        {
+            data = new
+            {
+                ids = new[] { O2Id(item.Id) },
+            },
+        };
+
+        return TryReadShareLink(
+            () => SendFormJson(HttpMethod.Post, "link", new Dictionary<string, string?>
+            {
+                ["action"] = "get",
+            }, singleIdPayload),
+            () => SendJson(HttpMethod.Post, "link", new Dictionary<string, string?>
+            {
+                ["action"] = "get",
+            }, singleIdPayload),
+            () => SendFormJson(HttpMethod.Post, "link", new Dictionary<string, string?>
+            {
+                ["action"] = "get",
+            }, arrayIdPayload),
+            () => SendJson(HttpMethod.Post, "link", new Dictionary<string, string?>
+            {
+                ["action"] = "get",
+            }, arrayIdPayload));
+    }
+
+    private string? TryGetExistingFolderShareLink(O2CloudItemDto item)
+    {
+        var payload = new
+        {
+            data = new
+            {
+                folderids = new[] { O2Id(item.Id) },
+            },
+        };
+
+        return TryReadShareLink(
+            () => SendFormJson(HttpMethod.Post, "link", new Dictionary<string, string?>
+            {
+                ["action"] = "get",
+            }, payload),
+            () => SendJson(HttpMethod.Post, "link", new Dictionary<string, string?>
+            {
+                ["action"] = "get",
+            }, payload));
+    }
+
+    private static string? TryReadShareLink(params Func<JsonDocument?>[] operations)
+    {
+        foreach (var operation in operations)
+        {
+            try
+            {
+                using var document = operation();
+                if (document is null)
+                {
+                    continue;
+                }
+
+                var url = ShareUrlFrom(document.RootElement);
+                if (!string.IsNullOrWhiteSpace(url))
+                {
+                    return url;
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        return null;
     }
 
     private IEnumerable<string> ResolveCachedReadUrls(O2CloudItemDto item)
@@ -1047,6 +1199,77 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         VerifyMovedToTrash(item);
     }
 
+    public O2CloudItemDto RestoreFromTrash(O2CloudItemDto item)
+    {
+        if (IsPendingUploadId(item.Id))
+        {
+            item = ResolvePendingUploadForMutation(item);
+        }
+
+        var oneIdPayload = new
+        {
+            data = new
+            {
+                id = O2Id(item.Id),
+            },
+        };
+        var idsPayload = new
+        {
+            data = new
+            {
+                ids = new[] { O2Id(item.Id) },
+            },
+        };
+
+        using var document = item.IsFolder
+            ? FirstSuccess(
+                () => SendJson(HttpMethod.Post, "trash/folder", new Dictionary<string, string?>
+                {
+                    ["action"] = "restore",
+                }, oneIdPayload),
+                () => SendFormJson(HttpMethod.Post, "trash/folder", new Dictionary<string, string?>
+                {
+                    ["action"] = "restore",
+                }, oneIdPayload) ?? throw new InvalidOperationException("O2 Cloud no devolvio respuesta al restaurar la carpeta."),
+                () => SendJson(HttpMethod.Post, "trash/folder", new Dictionary<string, string?>
+                {
+                    ["action"] = "restore",
+                }, idsPayload))
+            : FirstSuccess(
+                () => SendJson(HttpMethod.Post, "trash/file", new Dictionary<string, string?>
+                {
+                    ["action"] = "restore",
+                }, oneIdPayload),
+                () => SendFormJson(HttpMethod.Post, "trash/file", new Dictionary<string, string?>
+                {
+                    ["action"] = "restore",
+                }, oneIdPayload) ?? throw new InvalidOperationException("O2 Cloud no devolvio respuesta al restaurar el archivo."),
+                () => SendJson(HttpMethod.Post, "media/trash", new Dictionary<string, string?>
+                {
+                    ["action"] = "restore",
+                }, oneIdPayload),
+                () => SendJson(HttpMethod.Post, "media/trash", new Dictionary<string, string?>
+                {
+                    ["action"] = "restore",
+                }, idsPayload));
+
+        return TryParseItem(document, item.ParentId ?? string.Empty, item.IsFolder, item.Name)
+            ?? new O2CloudItemDto(
+                item.Id,
+                FirstString(ObjectProperty(document.RootElement, "data"), "name") ??
+                FirstString(document.RootElement, "name") ??
+                item.Name,
+                item.ParentId,
+                item.IsFolder,
+                item.Size,
+                item.ModifiedAt,
+                item.DirectUrl,
+                item.MediaKind,
+                item.Fingerprint,
+                item.Node,
+                item.DownloadToken);
+    }
+
     public void PermanentlyDelete(O2CloudItemDto item)
     {
         if (IsPendingUploadId(item.Id))
@@ -1177,48 +1400,67 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
     {
         var currentFolderIds = KnownFolderIdCandidates(folderId).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        using var document = SendJson(HttpMethod.Get, "media/folder", new Dictionary<string, string?>
-        {
-            ["action"] = "list",
-            ["parentid"] = folderId,
-        });
+        var pageSignatures = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        var root = document.RootElement;
-        var data = ObjectProperty(root, "data");
-        var folders = ArrayProperty(data, "folders");
-        if (folders.Count == 0)
+        for (var offset = 0; ; offset += PageSize)
         {
-            folders = ArrayProperty(root, "folders");
-        }
-
-        foreach (var folder in folders)
-        {
-            var folderIdCandidates = FolderIdCandidates(folder);
-            var id = folderIdCandidates
-                .FirstOrDefault(candidate => !currentFolderIds.Contains(candidate));
-            if (string.IsNullOrWhiteSpace(id))
+            using var document = SendJson(HttpMethod.Get, "media/folder", new Dictionary<string, string?>
             {
-                continue;
+                ["action"] = "list",
+                ["parentid"] = folderId,
+                ["limit"] = PageSize.ToString(CultureInfo.InvariantCulture),
+                ["offset"] = offset > 0 ? offset.ToString(CultureInfo.InvariantCulture) : null,
+            });
+
+            var root = document.RootElement;
+            var data = ObjectProperty(root, "data");
+            var folders = ArrayProperty(data, "folders");
+            if (folders.Count == 0)
+            {
+                folders = ArrayProperty(root, "folders");
             }
 
-            if (!seen.Add(id))
+            if (!pageSignatures.Add(PageSignature(folders, FolderIdCandidates)))
             {
-                continue;
+                break;
             }
 
-            RegisterFolderIdCandidates(id, folderIdCandidates);
-            items.Add(new O2CloudItemDto(
-                id,
-                FirstString(folder, "name") ?? "Carpeta",
-                folderId,
-                IsFolder: true,
-                Size: 0,
-                ModifiedAt: FirstDate(folder, "modificationdate", "creationdate", "date"),
-                DirectUrl: null,
-                MediaKind: null,
-                Fingerprint: null,
-                Node: null,
-                DownloadToken: null));
+            var addedInPage = 0;
+            foreach (var folder in folders)
+            {
+                var folderIdCandidates = FolderIdCandidates(folder);
+                var id = folderIdCandidates
+                    .FirstOrDefault(candidate => !currentFolderIds.Contains(candidate));
+                if (string.IsNullOrWhiteSpace(id))
+                {
+                    continue;
+                }
+
+                if (!seen.Add(id))
+                {
+                    continue;
+                }
+
+                RegisterFolderIdCandidates(id, folderIdCandidates);
+                items.Add(new O2CloudItemDto(
+                    id,
+                    FirstString(folder, "name") ?? "Carpeta",
+                    folderId,
+                    IsFolder: true,
+                    Size: 0,
+                    ModifiedAt: FirstDate(folder, "modificationdate", "creationdate", "date"),
+                    DirectUrl: null,
+                    MediaKind: null,
+                    Fingerprint: null,
+                    Node: null,
+                    DownloadToken: null));
+                addedInPage++;
+            }
+
+            if (folders.Count == 0 || addedInPage == 0 || folders.Count < PageSize)
+            {
+                break;
+            }
         }
     }
 
@@ -1953,6 +2195,19 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
 
         foreach (var container in new[] { data, root })
         {
+            foreach (var collectionName in new[] { "links", "sets", "items" })
+            {
+                var links = ArrayProperty(container, collectionName);
+                foreach (var link in links)
+                {
+                    var value = FirstString(link, "url", "link", "shareurl", "shareUrl");
+                    if (!string.IsNullOrWhiteSpace(value))
+                    {
+                        return value;
+                    }
+                }
+            }
+
             foreach (var name in new[] { "set", "link", "share", "mediaSet" })
             {
                 var child = FirstObjectProperty(container, name);
@@ -1977,7 +2232,10 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         var value = AbsoluteMediaUrl(rawUrl, _baseUri.GetLeftPart(UriPartial.Authority));
         var uri = new Uri(value, UriKind.Absolute);
         var query = QueryParameters(uri);
-        query["filename"] = fileName;
+        if (!uri.AbsolutePath.EndsWith("/sapi/download/video", StringComparison.OrdinalIgnoreCase))
+        {
+            query["filename"] = fileName;
+        }
 
         var builder = new UriBuilder(uri)
         {
@@ -2027,18 +2285,12 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
 
     private string BuildNativeVideoUrl(string fileName, string node, string token)
     {
-        var session = _authService.GetCurrentSession();
         var query = new Dictionary<string, string?>
         {
             ["action"] = "get",
             ["k"] = token,
             ["node"] = node,
-            ["filename"] = fileName,
         };
-        if (session.IsAuthenticated)
-        {
-            query["validationkey"] = session.ValidationKey;
-        }
 
         var builder = new UriBuilder(new Uri(_baseUri, "download/video"))
         {
@@ -2846,6 +3098,19 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             JsonValueKind.Object => IsMeaningfulErrorObject(error),
             JsonValueKind.Array => error.GetArrayLength() > 0,
             _ => true,
+        };
+    }
+
+    private static bool HasMeaningfulChanges(JsonElement element)
+    {
+        return element.ValueKind switch
+        {
+            JsonValueKind.Object => element.EnumerateObject().Any(property => HasMeaningfulChanges(property.Value)),
+            JsonValueKind.Array => element.GetArrayLength() > 0,
+            JsonValueKind.String => !string.IsNullOrWhiteSpace(element.GetString()),
+            JsonValueKind.Number => element.GetRawText() != "0",
+            JsonValueKind.True => true,
+            _ => false,
         };
     }
 

@@ -27,11 +27,21 @@ Aplicacion Windows en C#/.NET 8 que monta O2 Cloud como una unidad virtual con W
 Para usuario final se recomienda usar el instalador:
 
 ```text
-dist\O2CloudDrive-0.5-beta-Setup.exe
+dist\O2CloudDrive-0.7-beta-Setup.exe
 ```
 
 Ese instalador no necesita que el equipo tenga .NET 8 instalado. Incluye la app autocontenida, WinFsp y Microsoft Edge WebView2 Runtime x64. Al ejecutarlo pedira permisos de administrador porque WinFsp instala un driver de sistema. Si WinFsp o WebView2 ya existen en el equipo, el instalador los omite.
 Antes de instalar permite elegir la carpeta de destino. La desinstalacion se hace desde un asistente grafico con confirmacion y barra de progreso.
+
+## Actualizaciones
+
+La aplicacion puede comprobar automaticamente las releases publicadas en GitHub al iniciar. Si hay una version nueva, muestra una notificacion y una ventana con enlace de descarga del instalador.
+
+Tambien se puede comprobar manualmente desde el icono de la bandeja:
+
+```text
+Buscar actualizaciones
+```
 
 ## Instalar WinFsp
 
@@ -66,11 +76,34 @@ El instalador completo se genera con:
 Salida esperada:
 
 ```text
-dist\O2CloudDrive-0.5-beta-Setup.exe
-dist\O2CloudDrive-0.5-beta-Setup.sha256.txt
+dist\O2CloudDrive-0.7-beta-Setup.exe
+dist\O2CloudDrive-0.7-beta-Setup.sha256.txt
 ```
 
 El script descarga los prerrequisitos oficiales si no estan ya en `installer\prereqs`, publica la app como autocontenida, empaqueta el payload y publica un setup unico para Windows x64.
+
+## Firma digital
+
+El script de instalador tiene soporte opcional para firmar los ejecutables con `signtool.exe`. Si no se indica certificado, la firma se omite y el instalador se genera igual.
+
+Firmar con un certificado instalado en el almacen de Windows:
+
+```powershell
+.\installer\build-installer.ps1 -CertificateThumbprint "THUMBPRINT_DEL_CERTIFICADO"
+```
+
+Firmar con un certificado `.pfx`:
+
+```powershell
+$env:O2CLOUDDRIVE_PFX_PASSWORD = "password-del-pfx"
+.\installer\build-installer.ps1 -CertificatePath ".\certificados\codigo.pfx"
+```
+
+Opcionalmente se puede indicar la ruta de `signtool.exe`:
+
+```powershell
+.\installer\build-installer.ps1 -CertificateThumbprint "THUMBPRINT_DEL_CERTIFICADO" -SignToolPath "C:\Program Files (x86)\Windows Kits\10\bin\x64\signtool.exe"
+```
 
 ## Ejecutar la aplicacion Windows
 
@@ -109,7 +142,7 @@ Para una prueba automatizada de montaje:
 .\.dotnet\dotnet.exe run --project .\src\O2CloudDrive\O2CloudDrive.csproj -c Release -- --mount O: --skip-auth --run-for-seconds 15
 ```
 
-El modo normal de usuario ya no requiere consola: abre el `.exe` y pulsa `Login nuevo` o `Montar`. La app comprueba Windows Credential Manager. Si no hay sesion valida, abre una ventana WebView2 con el login oficial de O2 Cloud. Introduce telefono, contraseña y SMS ahi. Cuando la sesion valida, se guarda en Credential Manager y se monta la unidad elegida con datos reales.
+El modo normal de usuario ya no requiere consola: abre el `.exe` y pulsa `Login nuevo` o `Montar`. La app comprueba Windows Credential Manager. Si no hay sesion valida, abre una ventana WebView2 con el login oficial de O2 Cloud. Introduce telefono, contrasena y SMS ahi. Cuando la sesion valida, se guarda en Credential Manager y se monta la unidad elegida con datos reales.
 
 El backend real permite crear carpetas, crear/subir archivos, renombrar, mover y enviar archivos o carpetas a la papelera. La escritura de archivos se confirma al cerrar o vaciar el manejador (`Flush/Cleanup` de WinFsp). Para el prototipo, la edicion de un archivo remoto existente descarga primero el archivo completo en memoria y esta limitada a 512 MB por operacion; la lectura normal sigue usando descargas parciales con `Range`.
 
@@ -145,6 +178,10 @@ Para validar el backend simulado sin montar WinFsp:
   "apiBaseUrl": "https://cloud.o2online.es/sapi/",
   "loginUrl": "https://cloud.o2online.es/",
   "credentialTarget": "O2CloudDrive.Session",
+  "updateOwner": "chemyglez",
+  "updateRepository": "O2CloudDrive",
+  "checkForUpdatesOnStartup": true,
+  "includePrereleaseUpdates": true,
   "useSimulatedData": false,
   "requireAuthentication": true
 }

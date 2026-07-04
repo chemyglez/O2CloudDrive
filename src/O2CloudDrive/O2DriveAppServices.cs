@@ -3,6 +3,7 @@ using O2CloudDrive.Auth;
 using O2CloudDrive.Caching;
 using O2CloudDrive.Config;
 using O2CloudDrive.Mounting;
+using O2CloudDrive.Updates;
 
 namespace O2CloudDrive;
 
@@ -16,7 +17,8 @@ public sealed class O2DriveAppServices : IDisposable
         LocalCacheService cacheService,
         IAuthService authService,
         O2CloudApiClient apiClient,
-        O2DriveMountService mountService)
+        O2DriveMountService mountService,
+        UpdateService updateService)
     {
         Config = config;
         _httpClient = httpClient;
@@ -24,6 +26,7 @@ public sealed class O2DriveAppServices : IDisposable
         AuthService = authService;
         ApiClient = apiClient;
         MountService = mountService;
+        UpdateService = updateService;
     }
 
     public AppConfig Config { get; }
@@ -31,6 +34,7 @@ public sealed class O2DriveAppServices : IDisposable
     public IAuthService AuthService { get; }
     public O2CloudApiClient ApiClient { get; }
     public O2DriveMountService MountService { get; }
+    public UpdateService UpdateService { get; }
 
     public static O2DriveAppServices Create(AppConfig config)
     {
@@ -50,7 +54,8 @@ public sealed class O2DriveAppServices : IDisposable
         var authService = new AuthService(sessionStore, loginService, sessionValidator);
         var apiClient = new O2CloudApiClient(httpClient, authService, config.ApiBaseUrl);
         var mountService = new O2DriveMountService(apiClient);
-        return new O2DriveAppServices(config, httpClient, cacheService, authService, apiClient, mountService);
+        var updateService = new UpdateService(httpClient, config);
+        return new O2DriveAppServices(config, httpClient, cacheService, authService, apiClient, mountService, updateService);
     }
 
     public void Dispose()

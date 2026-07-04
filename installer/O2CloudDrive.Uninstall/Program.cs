@@ -84,6 +84,7 @@ internal static class Program
 
         progress.Report(new UninstallProgress(50, "Quitando integracion del Explorador..."));
         TryDeleteCurrentUserKey(@"Software\Classes\*\shell\O2CloudDriveShare");
+        TryDeleteCurrentUserKey(@"Software\Classes\Directory\shell\O2CloudDriveShare");
 
         progress.Report(new UninstallProgress(62, "Quitando registro de desinstalacion..."));
         TryDeleteLocalMachineKey(UninstallKey);

@@ -4,6 +4,7 @@ public sealed class O2SessionValidator
 {
     private static readonly ValidationProbe[] Probes =
     [
+        new(HttpMethod.Get, "profile/role", "action=get"),
         new(HttpMethod.Get, "profile", "action=get"),
         new(HttpMethod.Get, "user/status", "action=get"),
         new(HttpMethod.Post, "media/folder/root", "action=get"),

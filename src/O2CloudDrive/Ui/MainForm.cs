@@ -2,6 +2,7 @@ using System.Diagnostics;
 using O2CloudDrive.Api;
 using O2CloudDrive.Config;
 using O2CloudDrive.Mounting;
+using O2CloudDrive.Updates;
 
 namespace O2CloudDrive.Ui;
 
@@ -43,11 +44,13 @@ public sealed class MainForm : Form
     private readonly Button _unmountButton;
     private readonly Button _logoutButton;
     private readonly NotifyIcon _notifyIcon;
+    private readonly CancellationTokenSource _updateCheckCancellation = new();
     private readonly List<string> _logLines = [];
     private readonly Dictionary<string, int> _lastTransferPercentLogged = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTimeOffset> _lastTransferLogAt = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, int> _liveTransferLogIndex = new(StringComparer.OrdinalIgnoreCase);
     private bool _busy;
+    private bool _checkingUpdates;
     private bool _allowClose;
     private string _lastStatus = "Listo.";
 
@@ -93,6 +96,10 @@ public sealed class MainForm : Form
             UpdateState(_services.AuthService.HasStoredSession()
                 ? "auth:stored-session"
                 : "Listo.");
+            if (_services.Config.CheckForUpdatesOnStartup)
+            {
+                BeginInvoke(new Action(() => _ = CheckForUpdatesAsync(silent: true)));
+            }
         };
         Resize += (_, _) =>
         {
@@ -148,7 +155,7 @@ public sealed class MainForm : Form
 
         var title = new Label
         {
-            Text = "O2 Cloud Drive 0.5 beta",
+            Text = $"O2 Cloud Drive {AppVersion.DisplayVersion}",
             AutoSize = true,
             Anchor = AnchorStyles.Left,
             Font = new Font("Segoe UI Semibold", 16F, FontStyle.Regular, GraphicsUnit.Point),
@@ -710,6 +717,7 @@ public sealed class MainForm : Form
         menu.Items.Add("Abrir", null, (_, _) => ShowFromTray());
         menu.Items.Add("Montar", null, async (_, _) => await MountAsync());
         menu.Items.Add("Desmontar", null, async (_, _) => await UnmountAsync());
+        menu.Items.Add("Buscar actualizaciones", null, async (_, _) => await CheckForUpdatesAsync(silent: false));
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Logout", null, async (_, _) => await LogoutAsync());
         menu.Items.Add("Salir", null, async (_, _) => await ExitAsync());
@@ -717,7 +725,8 @@ public sealed class MainForm : Form
         {
             menu.Items[1].Enabled = !_services.MountService.IsMounted && !_busy;
             menu.Items[2].Enabled = _services.MountService.IsMounted && !_busy;
-            menu.Items[4].Enabled = !_busy;
+            menu.Items[3].Enabled = !_checkingUpdates;
+            menu.Items[5].Enabled = !_busy;
         };
         return menu;
     }
@@ -833,6 +842,7 @@ public sealed class MainForm : Form
     private async Task ExitAsync()
     {
         _allowClose = true;
+        _updateCheckCancellation.Cancel();
         if (_services.MountService.IsMounted)
         {
             await UnmountAsync();
@@ -1001,6 +1011,8 @@ public sealed class MainForm : Form
     {
         if (_allowClose || e.CloseReason == CloseReason.WindowsShutDown)
         {
+            _updateCheckCancellation.Cancel();
+            _updateCheckCancellation.Dispose();
             _services.ApiClient.TransferProgress -= OnTransferProgress;
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
@@ -1078,6 +1090,87 @@ public sealed class MainForm : Form
         }
 
         SetControlsEnabled(!_busy);
+    }
+
+    private async Task CheckForUpdatesAsync(bool silent)
+    {
+        if (_checkingUpdates)
+        {
+            return;
+        }
+
+        _checkingUpdates = true;
+        if (!silent)
+        {
+            AppendLog("update:checking");
+        }
+
+        try
+        {
+            var result = await _services.UpdateService.CheckForUpdatesAsync(_updateCheckCancellation.Token);
+            if (result is { IsUpdateAvailable: true, Release: not null })
+            {
+                AppendLog($"update:available {result.Release.TagName}");
+                ShowUpdateNotification(result.Release);
+                using var form = new UpdateAvailableForm(result.Release);
+                if (!Visible || WindowState == FormWindowState.Minimized)
+                {
+                    ShowFromTray();
+                }
+
+                form.ShowDialog(this);
+                return;
+            }
+
+            if (!string.IsNullOrWhiteSpace(result.ErrorMessage))
+            {
+                if (!silent)
+                {
+                    AppendLog($"update:error {result.ErrorMessage}");
+                    MessageBox.Show(
+                        this,
+                        result.ErrorMessage,
+                        "O2 Cloud Drive",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
+
+                return;
+            }
+
+            if (!silent)
+            {
+                AppendLog("update:current");
+                MessageBox.Show(
+                    this,
+                    "Ya tienes instalada la ultima version publicada.",
+                    "O2 Cloud Drive",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        finally
+        {
+            _checkingUpdates = false;
+        }
+    }
+
+    private void ShowUpdateNotification(UpdateRelease release)
+    {
+        try
+        {
+            _notifyIcon.ShowBalloonTip(
+                4500,
+                "O2 Cloud Drive",
+                $"Nueva version disponible: {release.Name}",
+                ToolTipIcon.Info);
+        }
+        catch (InvalidOperationException)
+        {
+        }
     }
 
     private void AppendLog(string message)
@@ -1189,9 +1282,21 @@ public sealed class MainForm : Form
             return $"Error: {message["error:".Length..]}. Revisa el mensaje mostrado por la aplicacion.";
         }
 
+        if (message.StartsWith("update:available ", StringComparison.OrdinalIgnoreCase))
+        {
+            return $"Actualizacion: nueva version disponible {message["update:available ".Length..]}.";
+        }
+
+        if (message.StartsWith("update:error ", StringComparison.OrdinalIgnoreCase))
+        {
+            return $"Actualizacion: no se pudo comprobar GitHub. {message["update:error ".Length..]}";
+        }
+
         return message switch
         {
             "Listo." => "Preparada.",
+            "update:checking" => "Actualizacion: comprobando versiones publicadas en GitHub.",
+            "update:current" => "Actualizacion: la version instalada esta al dia.",
             "auth:stored-session" => "Sesion guardada detectada en el equipo.",
             "auth:login:start" => "Login: abriendo navegador integrado; se conserva el estado web para que el SMS de O2 no se reinicie entre intentos.",
             "auth:login:ok" => "Login: sesion validada contra O2 Cloud.",

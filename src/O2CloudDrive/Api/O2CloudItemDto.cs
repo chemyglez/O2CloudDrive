@@ -14,3 +14,5 @@ public sealed record O2CloudItemDto(
     string? DownloadToken);
 
 public sealed record O2StorageInfo(long UsedBytes, long TotalBytes, long FreeBytes);
+
+public sealed record O2ChangeSummary(bool HasChanges, long NextCursor);

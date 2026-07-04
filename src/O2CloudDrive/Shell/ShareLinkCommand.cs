@@ -14,7 +14,7 @@ internal static class ShareLinkCommand
         {
             if (string.IsNullOrWhiteSpace(selectedPath))
             {
-                throw new InvalidOperationException("No se recibio ningun archivo para compartir.");
+                throw new InvalidOperationException("No se recibio ningun elemento para compartir.");
             }
 
             var session = services.AuthService.EnsureAuthenticated(allowInteractive: true);
@@ -27,12 +27,12 @@ internal static class ShareLinkCommand
             var store = new O2CloudFileStore(services.ApiClient);
             if (!store.TryGetByPath(virtualPath, out var node))
             {
-                throw new FileNotFoundException("El archivo no aparece en el listado remoto de O2 Cloud.", selectedPath);
+                throw new FileNotFoundException("El elemento no aparece en el listado remoto de O2 Cloud.", selectedPath);
             }
 
-            if (node.IsDirectory || node.IsVirtualTrashRoot || node.IsTrashItem)
+            if (node.IsVirtualTrashRoot || node.IsTrashItem)
             {
-                throw new InvalidOperationException("Solo se pueden compartir archivos de O2 Cloud.");
+                throw new InvalidOperationException("No se pueden compartir elementos de la papelera.");
             }
 
             var item = ToDto(node);
@@ -45,7 +45,7 @@ internal static class ShareLinkCommand
         {
             MessageBox.Show(
                 ex.Message,
-                "Compartir desde la nube",
+            "Compartir O2 Cloud",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
             return 1;
@@ -97,7 +97,7 @@ internal static class ShareLinkCommand
             node.Id,
             node.Name,
             node.Parent?.Id,
-            IsFolder: false,
+            node.IsDirectory,
             checked((long)node.Size),
             DateTimeOffset.FromFileTime(checked((long)node.LastWriteTime)),
             node.DirectUrl,
