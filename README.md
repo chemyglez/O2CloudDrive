@@ -31,7 +31,6 @@ dist\O2CloudDrive-0.7-beta-Setup.exe
 ```
 
 Ese instalador no necesita que el equipo tenga .NET 8 instalado. Incluye la app autocontenida, WinFsp y Microsoft Edge WebView2 Runtime x64. Al ejecutarlo pedira permisos de administrador porque WinFsp instala un driver de sistema. Si WinFsp o WebView2 ya existen en el equipo, el instalador los omite.
-Antes de instalar permite elegir la carpeta de destino. La desinstalacion se hace desde un asistente grafico con confirmacion y barra de progreso.
 
 ## Actualizaciones
 
