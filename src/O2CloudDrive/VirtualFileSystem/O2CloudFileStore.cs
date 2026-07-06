@@ -55,6 +55,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
     private long _remoteChangesCursor = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
     private DateTimeOffset _nextRemoteChangesCheckAt = DateTimeOffset.UtcNow.Add(RemoteChangesCheckInterval);
     private DateTimeOffset _nextReadCachePruneAt = DateTimeOffset.UtcNow.Add(ReadCachePruneInterval);
+    private bool _remoteChangesCheckInProgress;
 
     public O2CloudFileStore(IO2CloudApiClient apiClient)
         : this(apiClient, ReadCacheOptions.Default)
@@ -617,7 +618,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
     private void RefreshForRemoteChangesIfNeeded()
     {
         var now = DateTimeOffset.UtcNow;
-        if (now < _nextRemoteChangesCheckAt)
+        if (now < _nextRemoteChangesCheckAt || _remoteChangesCheckInProgress)
         {
             return;
         }
@@ -628,20 +629,44 @@ public sealed class O2CloudFileStore : ICloudFileStore
             return;
         }
 
+        _remoteChangesCheckInProgress = true;
+        var cursor = _remoteChangesCursor;
+        _ = Task.Run(() => RefreshForRemoteChangesInBackground(cursor));
+    }
+
+    private void RefreshForRemoteChangesInBackground(long cursor)
+    {
+        O2ChangeSummary? changes = null;
         try
         {
-            var changes = _apiClient.GetChangesSince(_remoteChangesCursor);
-            _remoteChangesCursor = Math.Max(_remoteChangesCursor, changes.NextCursor);
-            if (changes.HasChanges)
-            {
-                if (!TryInvalidateChangedChildren(Root, changes))
-                {
-                    InvalidateLoadedChildren(Root);
-                }
-            }
+            changes = _apiClient.GetChangesSince(cursor);
         }
         catch
         {
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                try
+                {
+                    if (changes is not null)
+                    {
+                        _remoteChangesCursor = Math.Max(_remoteChangesCursor, changes.NextCursor);
+                        if (changes.HasChanges && !HasActiveLocalChanges(Root))
+                        {
+                            if (!TryInvalidateChangedChildren(Root, changes))
+                            {
+                                InvalidateLoadedChildren(Root);
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    _remoteChangesCheckInProgress = false;
+                }
+            }
         }
     }
 

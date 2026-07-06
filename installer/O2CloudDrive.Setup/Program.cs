@@ -10,7 +10,7 @@ namespace O2CloudDrive.Setup;
 internal static class Program
 {
     private const string ProductName = "O2 Cloud Drive";
-    private const string DisplayVersion = "0.8 beta";
+    private const string DisplayVersion = "0.8.1 beta";
     private const string Publisher = "Chemys";
     private const string WebView2ClientKey = @"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
     private const string UninstallKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\O2CloudDrive";

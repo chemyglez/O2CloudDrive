@@ -20,7 +20,7 @@ internal sealed class InstallerForm : Form
         _scale = Math.Max(1F, graphics.DpiX / 96F);
 
         AutoScaleMode = AutoScaleMode.None;
-        Text = "O2 Cloud Drive 0.8 beta";
+        Text = "O2 Cloud Drive 0.8.1 beta";
         ClientSize = ScaledSize(760, 330);
         MinimumSize = SizeFromClientSize(ClientSize);
         FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -204,8 +204,8 @@ internal sealed class InstallerForm : Form
 
             MessageBox.Show(
                 NeedsReboot
-                    ? "O2 Cloud Drive 0.8 beta se ha instalado correctamente. WinFsp ha pedido reiniciar Windows antes de montar unidades."
-                    : "O2 Cloud Drive 0.8 beta se ha instalado correctamente.",
+                    ? "O2 Cloud Drive 0.8.1 beta se ha instalado correctamente. WinFsp ha pedido reiniciar Windows antes de montar unidades."
+                    : "O2 Cloud Drive 0.8.1 beta se ha instalado correctamente.",
                 "O2 Cloud Drive",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
