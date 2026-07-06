@@ -946,7 +946,6 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
 
         using var response = SendUploadRequest(request, uploadCancellation.Token);
         stallTimer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
-        CaptureCookies(response);
         var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
         if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
         {
@@ -2067,7 +2066,6 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         }
 
         using var response = _httpClient.Send(request);
-        CaptureCookies(response);
         response.EnsureSuccessStatusCode();
         var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
         var document = ParseJson(text);
@@ -2089,7 +2087,6 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         ]);
 
         using var response = _httpClient.Send(request);
-        CaptureCookies(response);
         response.EnsureSuccessStatusCode();
         var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
         return ParseOptionalJson(text);
@@ -2149,32 +2146,6 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         request.Headers.TryAddWithoutValidation("Referer", _baseUri.GetLeftPart(UriPartial.Authority) + "/");
         request.Headers.TryAddWithoutValidation("Accept-Language", "es-ES,es;q=0.9,en;q=0.8");
         request.Headers.TryAddWithoutValidation("X-deviceid", "O2CloudDrive");
-    }
-
-    private void CaptureCookies(HttpResponseMessage response)
-    {
-        if (!response.Headers.TryGetValues("Set-Cookie", out var setCookies))
-        {
-            return;
-        }
-
-        var session = _authService.GetCurrentSession();
-        foreach (var raw in setCookies)
-        {
-            var first = raw.Split(';', 2)[0].Trim();
-            var index = first.IndexOf('=');
-            if (index <= 0)
-            {
-                continue;
-            }
-
-            var name = first[..index].Trim();
-            var value = first[(index + 1)..].Trim();
-            if (!string.IsNullOrWhiteSpace(name) && !string.IsNullOrWhiteSpace(value))
-            {
-                session.Cookies[name] = value;
-            }
-        }
     }
 
     private string NormalizeShareLink(string rawUrl)

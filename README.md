@@ -27,7 +27,7 @@ Aplicacion Windows en C#/.NET 8 que monta O2 Cloud como una unidad virtual con W
 Para usuario final se recomienda usar el instalador:
 
 ```text
-dist\O2CloudDrive-0.8.1-beta-Setup.exe
+dist\O2CloudDrive-0.8.2-beta-Setup.exe
 ```
 
 Ese instalador no necesita que el equipo tenga .NET 8 instalado. Incluye la app autocontenida, WinFsp y Microsoft Edge WebView2 Runtime x64. Al ejecutarlo pedira permisos de administrador porque WinFsp instala un driver de sistema. Si WinFsp o WebView2 ya existen en el equipo, el instalador los omite.
@@ -50,7 +50,7 @@ Opciones principales en `appsettings.json`:
 
 - `cacheDirectory`: carpeta base del cache local.
 - `readCacheBlockSizeBytes`: tamano de bloque de lectura. Valor por defecto: `4194304` bytes.
-- `readAheadBlocks`: bloques que se precargan por delante en archivos multimedia. Valor por defecto: `3`.
+- `readAheadBlocks`: bloques que se precargan por delante en archivos multimedia. Valor por defecto: `0`.
 - `readCacheMaxBytes`: limite aproximado del cache de lectura. Valor por defecto: `21474836480` bytes.
 
 ## Instalar WinFsp
@@ -86,8 +86,8 @@ El instalador completo se genera con:
 Salida esperada:
 
 ```text
-dist\O2CloudDrive-0.8.1-beta-Setup.exe
-dist\O2CloudDrive-0.8.1-beta-Setup.sha256.txt
+dist\O2CloudDrive-0.8.2-beta-Setup.exe
+dist\O2CloudDrive-0.8.2-beta-Setup.sha256.txt
 ```
 
 El script descarga los prerrequisitos oficiales si no estan ya en `installer\prereqs`, publica la app como autocontenida, empaqueta el payload y publica un setup unico para Windows x64.

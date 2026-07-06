@@ -7,6 +7,7 @@ namespace O2CloudDrive.VirtualFileSystem;
 public sealed class O2CloudFileStore : ICloudFileStore
 {
     private const ulong MaxEditableFileBytes = 3_900_000_000UL;
+    private const uint DirectReadThresholdBytes = 256 * 1024;
     private const int MinReadCacheBlockSizeBytes = 256 * 1024;
     private const int MaxReadCacheBlockSizeBytes = 16 * 1024 * 1024;
     private const int MaxReadAheadBlocks = 8;
@@ -14,6 +15,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
     private const string TrashNodeName = "Papelera";
     private static readonly TimeSpan RemoteChangesCheckInterval = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan ReadCachePruneInterval = TimeSpan.FromMinutes(10);
+    private static readonly bool EnableRemoteChangesPolling = false;
     private static readonly string[] StreamableExtensions =
     [
         ".3gp",
@@ -617,6 +619,11 @@ public sealed class O2CloudFileStore : ICloudFileStore
 
     private void RefreshForRemoteChangesIfNeeded()
     {
+        if (!EnableRemoteChangesPolling)
+        {
+            return;
+        }
+
         var now = DateTimeOffset.UtcNow;
         if (now < _nextRemoteChangesCheckAt || _remoteChangesCheckInProgress)
         {
@@ -907,6 +914,11 @@ public sealed class O2CloudFileStore : ICloudFileStore
         if (length == 0 || fileSize == 0)
         {
             return [];
+        }
+
+        if (length <= DirectReadThresholdBytes)
+        {
+            return _apiClient.DownloadFile(item, offset, length);
         }
 
         var result = new byte[length];

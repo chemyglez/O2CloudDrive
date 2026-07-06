@@ -11,7 +11,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $PSScriptRoot
-$PackageLabel = "0.8.1-beta"
+$PackageLabel = "0.8.2-beta"
 $PublishDir = Join-Path $Root "dist\O2CloudDrive-$PackageLabel-win-x64"
 $SetupProject = Join-Path $PSScriptRoot "O2CloudDrive.Setup\O2CloudDrive.Setup.csproj"
 $UninstallProject = Join-Path $PSScriptRoot "O2CloudDrive.Uninstall\O2CloudDrive.Uninstall.csproj"
@@ -179,7 +179,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "dotnet publish del instalador fallo."
 }
 
-$publishedSetupExe = Join-Path $SetupPublishDir "O2CloudDrive-0.8.1-beta-Setup.exe"
+$publishedSetupExe = Join-Path $SetupPublishDir "O2CloudDrive-0.8.2-beta-Setup.exe"
 if (-not (Test-Path -LiteralPath $publishedSetupExe)) {
     throw "No se encontro el ejecutable publicado del instalador."
 }
