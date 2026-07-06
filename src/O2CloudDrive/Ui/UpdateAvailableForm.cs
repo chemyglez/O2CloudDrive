@@ -19,12 +19,13 @@ public sealed class UpdateAvailableForm : Form
 
         Text = "Actualizacion disponible";
         StartPosition = FormStartPosition.CenterParent;
-        FormBorderStyle = FormBorderStyle.FixedDialog;
-        MaximizeBox = false;
+        FormBorderStyle = FormBorderStyle.Sizable;
+        MaximizeBox = true;
         MinimizeBox = false;
         ShowInTaskbar = false;
         BackColor = AppBackColor;
-        ClientSize = new Size(500, 210);
+        ClientSize = new Size(680, 420);
+        MinimumSize = new Size(620, 360);
         Font = new Font("Segoe UI", 10F, FontStyle.Regular, GraphicsUnit.Point);
         Icon = AppIcon.Load();
 
@@ -42,9 +43,9 @@ public sealed class UpdateAvailableForm : Form
             BackColor = AppBackColor,
         };
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 60));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
 
         root.Controls.Add(new Label
         {

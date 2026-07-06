@@ -12,6 +12,7 @@ public interface IO2CloudApiClient
 {
     O2CloudItemDto GetRootFolder();
     O2StorageInfo GetStorageInfo();
+    bool KeepSessionAlive();
     O2ChangeSummary GetChangesSince(long from);
     IReadOnlyList<O2CloudItemDto> ListFolder(string folderId);
     IReadOnlyList<O2CloudItemDto> ListTrash();
@@ -170,6 +171,22 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             UsedBytes: Math.Max(0, used),
             TotalBytes: Math.Max(0, total.Value),
             FreeBytes: Math.Max(0, freeBytes));
+    }
+
+    public bool KeepSessionAlive()
+    {
+        try
+        {
+            using var _ = SendJson(HttpMethod.Get, "profile/role", new Dictionary<string, string?>
+            {
+                ["action"] = "get",
+            });
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     public O2ChangeSummary GetChangesSince(long from)

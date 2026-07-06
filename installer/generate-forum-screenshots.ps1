@@ -127,7 +127,7 @@ function Draw-Window($g, [int]$x, [int]$y, [int]$w, [int]$h, [string]$title) {
 function Draw-InstallerScreenshot {
     New-Canvas (Join-Path $outDir "01-instalador.png") {
         param($g)
-        Draw-Window $g 240 160 800 380 "O2 Cloud Drive 0.8.2 beta"
+        Draw-Window $g 240 160 800 380 "O2 Cloud Drive 0.8.3 beta"
         Draw-AppIcon $g 282 232 44
         Draw-Text $g "Instalar O2 Cloud Drive" (New-Font 20 ([System.Drawing.FontStyle]::Bold)) (ColorRgb 17 31 44) ([System.Drawing.RectangleF]::new(340, 226, 620, 46))
         Draw-Text $g "Carpeta de instalacion" (New-Font 10) (ColorRgb 75 91 107) ([System.Drawing.RectangleF]::new(282, 310, 670, 24))
@@ -157,7 +157,7 @@ function Draw-MainAppScreenshot {
         Draw-Window $g 180 92 920 560 "O2 Cloud Drive"
         $surface = ColorRgb 248 250 252
         $border = ColorRgb 202 211 222
-        Draw-Text $g "O2 Cloud Drive 0.8.2 beta" (New-Font 18 ([System.Drawing.FontStyle]::Bold)) (ColorRgb 27 34 42) ([System.Drawing.RectangleF]::new(222, 164, 520, 44))
+        Draw-Text $g "O2 Cloud Drive 0.8.3 beta" (New-Font 18 ([System.Drawing.FontStyle]::Bold)) (ColorRgb 27 34 42) ([System.Drawing.RectangleF]::new(222, 164, 520, 44))
         Draw-Button $g ([System.Drawing.RectangleF]::new(946, 164, 110, 40)) "Logout" (ColorRgb 199 62 44) (ColorRgb 255 255 255) (ColorRgb 199 62 44)
 
         Fill-RoundRect $g ([System.Drawing.RectangleF]::new(222, 226, 836, 142)) 8 $surface

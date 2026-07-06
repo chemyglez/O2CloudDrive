@@ -8,10 +8,14 @@ public sealed record DriveMountOptions(string MountPoint, string VolumeLabel, bo
 
 public sealed class O2DriveMountService : IDisposable
 {
+    private static readonly TimeSpan KeepAliveInitialDelay = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan KeepAliveInterval = TimeSpan.FromMinutes(3);
     private readonly object _gate = new();
     private readonly IO2CloudApiClient _apiClient;
     private readonly ReadCacheOptions _readCacheOptions;
     private FileSystemHost? _host;
+    private System.Threading.Timer? _keepAliveTimer;
+    private int _keepAliveRunning;
 
     public O2DriveMountService(IO2CloudApiClient apiClient)
         : this(apiClient, ReadCacheOptions.Default)
@@ -83,14 +87,18 @@ public sealed class O2DriveMountService : IDisposable
             _host = host;
             MountPoint = mountPoint;
             VolumeLabel = volumeLabel;
+            StartKeepAlive(options.UseSimulatedData);
         }
     }
 
     public void Unmount()
     {
         FileSystemHost? host;
+        System.Threading.Timer? keepAliveTimer;
         lock (_gate)
         {
+            keepAliveTimer = _keepAliveTimer;
+            _keepAliveTimer = null;
             host = _host;
             _host = null;
             MountPoint = null;
@@ -98,6 +106,7 @@ public sealed class O2DriveMountService : IDisposable
             LastRootItemCount = null;
         }
 
+        keepAliveTimer?.Dispose();
         if (host is null)
         {
             return;
@@ -110,6 +119,46 @@ public sealed class O2DriveMountService : IDisposable
         finally
         {
             host.Dispose();
+        }
+    }
+
+    private void StartKeepAlive(bool disabled)
+    {
+        if (disabled)
+        {
+            return;
+        }
+
+        _keepAliveTimer?.Dispose();
+        _keepAliveTimer = new System.Threading.Timer(
+            _ => RunKeepAlive(),
+            null,
+            KeepAliveInitialDelay,
+            KeepAliveInterval);
+    }
+
+    private void RunKeepAlive()
+    {
+        lock (_gate)
+        {
+            if (_host is null || _keepAliveTimer is null)
+            {
+                return;
+            }
+        }
+
+        if (Interlocked.Exchange(ref _keepAliveRunning, 1) == 1)
+        {
+            return;
+        }
+
+        try
+        {
+            _apiClient.KeepSessionAlive();
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _keepAliveRunning, 0);
         }
     }
 

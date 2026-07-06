@@ -366,7 +366,27 @@ public sealed class O2CloudFileStore : ICloudFileStore
             remoteItem = ToDto(file);
         }
 
-        var bytes = ReadRemoteBytesWithCache(remoteItem, offset, boundedLength, remoteSize);
+        byte[] bytes;
+        try
+        {
+            bytes = ReadRemoteBytesWithCache(remoteItem, offset, boundedLength, remoteSize);
+            if ((uint)bytes.Length < boundedLength &&
+                offset + (ulong)bytes.Length < remoteSize)
+            {
+                throw new IOException("O2 Cloud devolvio una lectura incompleta antes del final del archivo.");
+            }
+        }
+        catch (IOException) when (CanHydrateForReadFallback(remoteSize))
+        {
+            lock (_gate)
+            {
+                HydrateFile(file);
+                var localBytes = ReadLocalBytes(file, offset, boundedLength);
+                Touch(file, updateWriteTime: false);
+                return localBytes;
+            }
+        }
+
         lock (_gate)
         {
             Touch(file, updateWriteTime: false);
@@ -1258,6 +1278,11 @@ public sealed class O2CloudFileStore : ICloudFileStore
         {
             throw new IOException("El archivo supera el tamano maximo admitido por la subida de O2 Cloud.");
         }
+    }
+
+    private static bool CanHydrateForReadFallback(ulong length)
+    {
+        return length > 0 && length <= MaxEditableFileBytes && length <= uint.MaxValue;
     }
 
     private static bool HasLocalContent(CloudNode file)
