@@ -1,4 +1,5 @@
 using O2CloudDrive.Api;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace O2CloudDrive.VirtualFileSystem;
@@ -6,9 +7,32 @@ namespace O2CloudDrive.VirtualFileSystem;
 public sealed class O2CloudFileStore : ICloudFileStore
 {
     private const ulong MaxEditableFileBytes = 3_900_000_000UL;
+    private const int MinReadCacheBlockSizeBytes = 256 * 1024;
+    private const int MaxReadCacheBlockSizeBytes = 16 * 1024 * 1024;
+    private const int MaxReadAheadBlocks = 8;
     private const string TrashNodeId = "virtual:o2-trash";
     private const string TrashNodeName = "Papelera";
     private static readonly TimeSpan RemoteChangesCheckInterval = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan ReadCachePruneInterval = TimeSpan.FromMinutes(10);
+    private static readonly string[] StreamableExtensions =
+    [
+        ".3gp",
+        ".aac",
+        ".avi",
+        ".flac",
+        ".m4a",
+        ".m4v",
+        ".mkv",
+        ".mov",
+        ".mp3",
+        ".mp4",
+        ".mpeg",
+        ".mpg",
+        ".ogg",
+        ".wav",
+        ".webm",
+        ".wmv",
+    ];
     private static readonly string BaseWriteCacheDirectory = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "O2CloudDrive",
@@ -17,19 +41,37 @@ public sealed class O2CloudFileStore : ICloudFileStore
         TotalSize: 10UL * 1024UL * 1024UL * 1024UL * 1024UL,
         FreeSize: 10UL * 1024UL * 1024UL * 1024UL * 1024UL);
     private readonly object _gate = new();
+    private readonly object _readCacheGate = new();
     private readonly IO2CloudApiClient _apiClient;
     private readonly string _localContentDirectory;
+    private readonly string _readCacheDirectory;
+    private readonly int _readCacheBlockSizeBytes;
+    private readonly int _readAheadBlocks;
+    private readonly long _readCacheMaxBytes;
+    private readonly Dictionary<string, SemaphoreSlim> _readBlockLocks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _readAheadInFlight = new(StringComparer.OrdinalIgnoreCase);
     private ulong _nextIndex = 1;
     private CloudVolumeInfo _lastVolume = DefaultVolume;
     private long _remoteChangesCursor = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
     private DateTimeOffset _nextRemoteChangesCheckAt = DateTimeOffset.UtcNow.Add(RemoteChangesCheckInterval);
+    private DateTimeOffset _nextReadCachePruneAt = DateTimeOffset.UtcNow.Add(ReadCachePruneInterval);
 
     public O2CloudFileStore(IO2CloudApiClient apiClient)
+        : this(apiClient, ReadCacheOptions.Default)
+    {
+    }
+
+    public O2CloudFileStore(IO2CloudApiClient apiClient, ReadCacheOptions readCacheOptions)
     {
         _apiClient = apiClient;
+        _readCacheDirectory = Path.Combine(readCacheOptions.CacheDirectory, "ReadBlocks");
+        _readCacheBlockSizeBytes = Math.Clamp(readCacheOptions.BlockSizeBytes, MinReadCacheBlockSizeBytes, MaxReadCacheBlockSizeBytes);
+        _readAheadBlocks = Math.Clamp(readCacheOptions.ReadAheadBlocks, 0, MaxReadAheadBlocks);
+        _readCacheMaxBytes = Math.Max(0, readCacheOptions.MaxBytes);
         PurgeStaleWriteCaches();
         _localContentDirectory = Path.Combine(BaseWriteCacheDirectory, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_localContentDirectory);
+        Directory.CreateDirectory(_readCacheDirectory);
         var root = _apiClient.GetRootFolder();
         Root = NewNode(root.Id, string.Empty, CloudItemKind.Directory, null);
         ApplyMetadata(Root, root);
@@ -300,6 +342,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
     {
         O2CloudItemDto remoteItem;
         uint boundedLength;
+        ulong remoteSize;
         lock (_gate)
         {
             EnsureFile(file);
@@ -316,10 +359,11 @@ public sealed class O2CloudFileStore : ICloudFileStore
             }
 
             boundedLength = (uint)Math.Min(length, file.Size - offset);
+            remoteSize = file.Size;
             remoteItem = ToDto(file);
         }
 
-        var bytes = _apiClient.DownloadFile(remoteItem, offset, boundedLength);
+        var bytes = ReadRemoteBytesWithCache(remoteItem, offset, boundedLength, remoteSize);
         lock (_gate)
         {
             Touch(file, updateWriteTime: false);
@@ -590,7 +634,10 @@ public sealed class O2CloudFileStore : ICloudFileStore
             _remoteChangesCursor = Math.Max(_remoteChangesCursor, changes.NextCursor);
             if (changes.HasChanges)
             {
-                InvalidateLoadedChildren(Root);
+                if (!TryInvalidateChangedChildren(Root, changes))
+                {
+                    InvalidateLoadedChildren(Root);
+                }
             }
         }
         catch
@@ -625,6 +672,74 @@ public sealed class O2CloudFileStore : ICloudFileStore
         {
             node.Children.Clear();
             node.ChildrenLoaded = false;
+        }
+    }
+
+    private static bool TryInvalidateChangedChildren(CloudNode root, O2ChangeSummary changes)
+    {
+        if (changes.HasNewFileSystemItems)
+        {
+            return false;
+        }
+
+        var changedIds = new HashSet<string>(changes.FolderIds, StringComparer.OrdinalIgnoreCase);
+        changedIds.UnionWith(changes.FileIds);
+        if (changedIds.Count == 0)
+        {
+            return true;
+        }
+
+        var matchedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var parentsToInvalidate = new HashSet<CloudNode>();
+        var directoriesToInvalidate = new HashSet<CloudNode>();
+        CollectChangedNodes(root, changedIds, changes.FolderIds, matchedIds, parentsToInvalidate, directoriesToInvalidate);
+        if (matchedIds.Count != changedIds.Count)
+        {
+            return false;
+        }
+
+        foreach (var directory in directoriesToInvalidate)
+        {
+            InvalidateLoadedChildren(directory);
+        }
+
+        foreach (var parent in parentsToInvalidate)
+        {
+            parent.Children.Clear();
+            parent.ChildrenLoaded = false;
+        }
+
+        return true;
+    }
+
+    private static void CollectChangedNodes(
+        CloudNode node,
+        ISet<string> changedIds,
+        IReadOnlySet<string> changedFolderIds,
+        ISet<string> matchedIds,
+        ISet<CloudNode> parentsToInvalidate,
+        ISet<CloudNode> directoriesToInvalidate)
+    {
+        foreach (var child in node.Children.Values.ToList())
+        {
+            if (changedIds.Contains(child.Id))
+            {
+                matchedIds.Add(child.Id);
+                if (child.Parent is not null)
+                {
+                    parentsToInvalidate.Add(child.Parent);
+                }
+
+                if (child.IsDirectory && changedFolderIds.Contains(child.Id))
+                {
+                    directoriesToInvalidate.Add(child);
+                }
+            }
+
+            if (child.IsDirectory && child.ChildrenLoaded)
+            {
+                CollectChangedNodes(child, changedIds, changedFolderIds, matchedIds, parentsToInvalidate, directoriesToInvalidate);
+            }
         }
     }
 
@@ -760,6 +875,281 @@ public sealed class O2CloudFileStore : ICloudFileStore
             node.Fingerprint,
             node.Node,
             node.DownloadToken);
+    }
+
+    private byte[] ReadRemoteBytesWithCache(O2CloudItemDto item, ulong offset, uint length, ulong fileSize)
+    {
+        if (length == 0 || fileSize == 0)
+        {
+            return [];
+        }
+
+        var result = new byte[length];
+        var copied = 0;
+        var firstBlock = offset / (ulong)_readCacheBlockSizeBytes;
+        var lastBlock = (offset + length - 1) / (ulong)_readCacheBlockSizeBytes;
+
+        for (var blockIndex = firstBlock; blockIndex <= lastBlock; blockIndex++)
+        {
+            var blockOffset = blockIndex * (ulong)_readCacheBlockSizeBytes;
+            if (blockOffset >= fileSize)
+            {
+                break;
+            }
+
+            var blockLength = (uint)Math.Min((ulong)_readCacheBlockSizeBytes, fileSize - blockOffset);
+            var block = GetOrDownloadReadBlock(item, blockIndex, blockOffset, blockLength);
+            var sourceOffset = checked((int)Math.Min(offset > blockOffset ? offset - blockOffset : 0, (ulong)int.MaxValue));
+            if (sourceOffset >= block.Length)
+            {
+                continue;
+            }
+
+            var available = Math.Min(block.Length - sourceOffset, result.Length - copied);
+            if (available <= 0)
+            {
+                break;
+            }
+
+            Buffer.BlockCopy(block, sourceOffset, result, copied, available);
+            copied += available;
+        }
+
+        ScheduleReadAhead(item, fileSize, lastBlock + 1);
+        if (copied == result.Length)
+        {
+            return result;
+        }
+
+        Array.Resize(ref result, copied);
+        return result;
+    }
+
+    private byte[] GetOrDownloadReadBlock(O2CloudItemDto item, ulong blockIndex, ulong blockOffset, uint blockLength)
+    {
+        var cacheKey = ReadCacheKey(item);
+        var path = ReadCacheBlockPath(cacheKey, blockIndex);
+        if (TryReadCachedBlock(path, blockLength, out var cached))
+        {
+            return cached;
+        }
+
+        var blockLock = GetReadBlockLock($"{cacheKey}:{blockIndex}");
+        blockLock.Wait();
+        try
+        {
+            if (TryReadCachedBlock(path, blockLength, out cached))
+            {
+                return cached;
+            }
+
+            var downloaded = _apiClient.DownloadFile(item, blockOffset, blockLength);
+            if (downloaded.Length == blockLength)
+            {
+                WriteCachedBlock(path, downloaded);
+                PruneReadCacheIfNeeded();
+            }
+
+            return downloaded;
+        }
+        finally
+        {
+            blockLock.Release();
+        }
+    }
+
+    private SemaphoreSlim GetReadBlockLock(string key)
+    {
+        lock (_readCacheGate)
+        {
+            if (!_readBlockLocks.TryGetValue(key, out var blockLock))
+            {
+                blockLock = new SemaphoreSlim(1, 1);
+                _readBlockLocks[key] = blockLock;
+            }
+
+            return blockLock;
+        }
+    }
+
+    private static bool TryReadCachedBlock(string path, uint expectedLength, out byte[] content)
+    {
+        content = [];
+        try
+        {
+            var file = new FileInfo(path);
+            if (!file.Exists || file.Length != expectedLength)
+            {
+                return false;
+            }
+
+            content = File.ReadAllBytes(path);
+            File.SetLastAccessTimeUtc(path, DateTime.UtcNow);
+            return content.Length == expectedLength;
+        }
+        catch
+        {
+            content = [];
+            return false;
+        }
+    }
+
+    private static void WriteCachedBlock(string path, byte[] content)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            var temporaryPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            File.WriteAllBytes(temporaryPath, content);
+            File.Move(temporaryPath, path, overwrite: true);
+        }
+        catch
+        {
+            // Read cache must never make a filesystem read fail.
+        }
+    }
+
+    private void ScheduleReadAhead(O2CloudItemDto item, ulong fileSize, ulong startBlock)
+    {
+        if (_readAheadBlocks <= 0 || !IsStreamable(item))
+        {
+            return;
+        }
+
+        var startOffset = startBlock * (ulong)_readCacheBlockSizeBytes;
+        if (startOffset >= fileSize)
+        {
+            return;
+        }
+
+        var cacheKey = ReadCacheKey(item);
+        var readAheadKey = $"{cacheKey}:{startBlock}:{_readAheadBlocks}";
+        lock (_readCacheGate)
+        {
+            if (!_readAheadInFlight.Add(readAheadKey))
+            {
+                return;
+            }
+        }
+
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                for (var index = 0; index < _readAheadBlocks; index++)
+                {
+                    var blockIndex = startBlock + (ulong)index;
+                    var blockOffset = blockIndex * (ulong)_readCacheBlockSizeBytes;
+                    if (blockOffset >= fileSize)
+                    {
+                        break;
+                    }
+
+                    var blockLength = (uint)Math.Min((ulong)_readCacheBlockSizeBytes, fileSize - blockOffset);
+                    GetOrDownloadReadBlock(item, blockIndex, blockOffset, blockLength);
+                }
+            }
+            catch
+            {
+            }
+            finally
+            {
+                lock (_readCacheGate)
+                {
+                    _readAheadInFlight.Remove(readAheadKey);
+                }
+            }
+        });
+    }
+
+    private void PruneReadCacheIfNeeded()
+    {
+        if (_readCacheMaxBytes <= 0)
+        {
+            return;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        lock (_readCacheGate)
+        {
+            if (now < _nextReadCachePruneAt)
+            {
+                return;
+            }
+
+            _nextReadCachePruneAt = now.Add(ReadCachePruneInterval);
+        }
+
+        try
+        {
+            if (!Directory.Exists(_readCacheDirectory))
+            {
+                return;
+            }
+
+            var files = Directory.EnumerateFiles(_readCacheDirectory, "*.blk", SearchOption.AllDirectories)
+                .Select(path => new FileInfo(path))
+                .Where(file => file.Exists)
+                .OrderBy(file => file.LastAccessTimeUtc)
+                .ToList();
+            var totalBytes = files.Sum(file => file.Length);
+            if (totalBytes <= _readCacheMaxBytes)
+            {
+                return;
+            }
+
+            var targetBytes = (long)(_readCacheMaxBytes * 0.8);
+            foreach (var file in files)
+            {
+                try
+                {
+                    file.Delete();
+                    totalBytes -= file.Length;
+                }
+                catch
+                {
+                }
+
+                if (totalBytes <= targetBytes)
+                {
+                    break;
+                }
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    private string ReadCacheBlockPath(string cacheKey, ulong blockIndex)
+    {
+        return Path.Combine(_readCacheDirectory, cacheKey, blockIndex.ToString("x16") + ".blk");
+    }
+
+    private static string ReadCacheKey(O2CloudItemDto item)
+    {
+        var identity = string.Join(
+            "|",
+            item.Id,
+            item.Fingerprint,
+            item.Size.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            item.ModifiedAt?.ToUnixTimeMilliseconds().ToString(System.Globalization.CultureInfo.InvariantCulture),
+            item.DirectUrl);
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)));
+    }
+
+    private static bool IsStreamable(O2CloudItemDto item)
+    {
+        if (!string.IsNullOrWhiteSpace(item.MediaKind) &&
+            (item.MediaKind.Contains("video", StringComparison.OrdinalIgnoreCase) ||
+             item.MediaKind.Contains("audio", StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        var extension = Path.GetExtension(item.Name);
+        return !string.IsNullOrWhiteSpace(extension) &&
+               StreamableExtensions.Contains(extension, StringComparer.OrdinalIgnoreCase);
     }
 
     private void HydrateFile(CloudNode file)

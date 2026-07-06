@@ -4,6 +4,7 @@ using O2CloudDrive.Caching;
 using O2CloudDrive.Config;
 using O2CloudDrive.Mounting;
 using O2CloudDrive.Updates;
+using O2CloudDrive.VirtualFileSystem;
 
 namespace O2CloudDrive;
 
@@ -53,7 +54,12 @@ public sealed class O2DriveAppServices : IDisposable
         var loginService = new WebViewInteractiveLoginService(config.LoginUrl);
         var authService = new AuthService(sessionStore, loginService, sessionValidator);
         var apiClient = new O2CloudApiClient(httpClient, authService, config.ApiBaseUrl);
-        var mountService = new O2DriveMountService(apiClient);
+        var readCacheOptions = new ReadCacheOptions(
+            config.CacheDirectory,
+            config.ReadCacheBlockSizeBytes,
+            config.ReadAheadBlocks,
+            config.ReadCacheMaxBytes);
+        var mountService = new O2DriveMountService(apiClient, readCacheOptions);
         var updateService = new UpdateService(httpClient, config);
         return new O2DriveAppServices(config, httpClient, cacheService, authService, apiClient, mountService, updateService);
     }

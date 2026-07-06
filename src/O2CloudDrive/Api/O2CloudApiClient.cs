@@ -186,7 +186,15 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         var data = ObjectProperty(root, "data");
         var nextCursor = FirstLong(root, "requesttime", "responsetime") ??
                          DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        return new O2ChangeSummary(HasMeaningfulChanges(data), nextCursor);
+        var folderIds = ChangeIds(data, "folder");
+        var fileIds = ChangeIds(data, "file");
+        var hasFileSystemChanges = folderIds.Count > 0 || fileIds.Count > 0;
+        return new O2ChangeSummary(
+            hasFileSystemChanges,
+            nextCursor,
+            folderIds,
+            fileIds,
+            HasNewChanges(data, "folder") || HasNewChanges(data, "file"));
     }
 
     public IReadOnlyList<O2CloudItemDto> ListFolder(string folderId)
@@ -3112,6 +3120,65 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             JsonValueKind.True => true,
             _ => false,
         };
+    }
+
+    private static IReadOnlySet<string> ChangeIds(JsonElement data, string containerName)
+    {
+        var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var container = ObjectProperty(data, containerName);
+        if (container.ValueKind != JsonValueKind.Object)
+        {
+            return ids;
+        }
+
+        foreach (var property in container.EnumerateObject())
+        {
+            AddChangeIds(property.Value, ids);
+        }
+
+        return ids;
+    }
+
+    private static bool HasNewChanges(JsonElement data, string containerName)
+    {
+        var container = ObjectProperty(data, containerName);
+        return container.ValueKind == JsonValueKind.Object &&
+               container.TryGetProperty("N", out var created) &&
+               HasMeaningfulChanges(created);
+    }
+
+    private static void AddChangeIds(JsonElement element, ISet<string> ids)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Array:
+                foreach (var item in element.EnumerateArray())
+                {
+                    AddChangeIds(item, ids);
+                }
+
+                break;
+            case JsonValueKind.Object:
+                var id = FirstString(element, "id", "folderid", "fileid", "nodeid") ??
+                         FirstLong(element, "id", "folderid", "fileid", "nodeid")?.ToString(CultureInfo.InvariantCulture);
+                if (!string.IsNullOrWhiteSpace(id))
+                {
+                    ids.Add(id);
+                }
+
+                break;
+            case JsonValueKind.Number:
+                ids.Add(element.GetRawText());
+                break;
+            case JsonValueKind.String:
+                var value = element.GetString();
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    ids.Add(value);
+                }
+
+                break;
+        }
     }
 
     private static bool IsMeaningfulErrorObject(JsonElement error)

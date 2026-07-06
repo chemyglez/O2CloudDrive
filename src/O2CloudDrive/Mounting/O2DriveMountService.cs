@@ -10,11 +10,18 @@ public sealed class O2DriveMountService : IDisposable
 {
     private readonly object _gate = new();
     private readonly IO2CloudApiClient _apiClient;
+    private readonly ReadCacheOptions _readCacheOptions;
     private FileSystemHost? _host;
 
     public O2DriveMountService(IO2CloudApiClient apiClient)
+        : this(apiClient, ReadCacheOptions.Default)
+    {
+    }
+
+    public O2DriveMountService(IO2CloudApiClient apiClient, ReadCacheOptions readCacheOptions)
     {
         _apiClient = apiClient;
+        _readCacheOptions = readCacheOptions;
     }
 
     public bool IsMounted
@@ -48,7 +55,7 @@ public sealed class O2DriveMountService : IDisposable
 
             ICloudFileStore store = options.UseSimulatedData
                 ? new InMemoryCloudFileStore()
-                : new O2CloudFileStore(_apiClient);
+                : new O2CloudFileStore(_apiClient, _readCacheOptions);
             LastRootItemCount = TryGetRootItemCount(store, options.UseSimulatedData);
 
             var fileSystem = new O2VirtualFileSystem(store, volumeLabel);

@@ -15,4 +15,9 @@ public sealed record O2CloudItemDto(
 
 public sealed record O2StorageInfo(long UsedBytes, long TotalBytes, long FreeBytes);
 
-public sealed record O2ChangeSummary(bool HasChanges, long NextCursor);
+public sealed record O2ChangeSummary(
+    bool HasChanges,
+    long NextCursor,
+    IReadOnlySet<string> FolderIds,
+    IReadOnlySet<string> FileIds,
+    bool HasNewFileSystemItems);
