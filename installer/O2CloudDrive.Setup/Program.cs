@@ -24,6 +24,36 @@ internal static class Program
         "Programs",
         "O2 Cloud Drive");
 
+#if UPDATE_INSTALLER
+    internal const bool IsUpdateInstaller = true;
+#else
+    internal const bool IsUpdateInstaller = false;
+#endif
+
+#if FRAMEWORK_DEPENDENT_INSTALLER
+    internal const bool RequiresExternalDotNet = true;
+#else
+    internal const bool RequiresExternalDotNet = false;
+#endif
+
+    internal static string WindowTitle => IsUpdateInstaller
+        ? "O2 Cloud Drive 0.8.3 beta - Actualizacion"
+        : "O2 Cloud Drive 0.8.3 beta";
+
+    internal static string MainHeading => IsUpdateInstaller
+        ? "Actualizar O2 Cloud Drive"
+        : "Instalar O2 Cloud Drive";
+
+    internal static string PrimaryActionText => IsUpdateInstaller ? "Actualizar" : "Instalar";
+
+    internal static string CompletedHeading => IsUpdateInstaller
+        ? "Actualizacion completada"
+        : "Instalacion completada";
+
+    internal static string CompletedMessage => IsUpdateInstaller
+        ? "O2 Cloud Drive se ha actualizado correctamente."
+        : "O2 Cloud Drive 0.8.3 beta se ha instalado correctamente.";
+
     [STAThread]
     private static int Main(string[] args)
     {
@@ -55,12 +85,17 @@ internal static class Program
         {
             progress.Report(new InstallProgress(5, "Preparando instalador..."));
             var payloadZip = await ExtractResourceAsync("payload.zip", workDir, cancellationToken);
-            var winFspMsi = await ExtractResourceAsync("winfsp-2.1.25156.msi", workDir, cancellationToken);
-            var webView2Installer = await ExtractResourceAsync("MicrosoftEdgeWebView2RuntimeInstallerX64.exe", workDir, cancellationToken);
+            var winFspMsi = await TryExtractResourceAsync("winfsp-2.1.25156.msi", workDir, cancellationToken);
+            var webView2Installer = await TryExtractResourceAsync("MicrosoftEdgeWebView2RuntimeInstallerX64.exe", workDir, cancellationToken);
             var uninstaller = await ExtractResourceAsync("O2CloudDrive.Uninstall.exe", workDir, cancellationToken);
 
             if (!IsWinFspInstalled())
             {
+                if (winFspMsi is null)
+                {
+                    throw new InvalidOperationException("WinFsp no esta instalado. Esta version de actualizacion no lo incluye; usa el instalador completo de O2 Cloud Drive.");
+                }
+
                 progress.Report(new InstallProgress(20, "Instalando WinFsp..."));
                 var code = await RunProcessAsync("msiexec.exe", $"/i \"{winFspMsi}\" /qn /norestart", [0, 3010], cancellationToken);
                 InstallerForm.NeedsReboot = code == 3010;
@@ -72,6 +107,11 @@ internal static class Program
 
             if (!IsWebView2Installed())
             {
+                if (webView2Installer is null)
+                {
+                    throw new InvalidOperationException("Microsoft Edge WebView2 Runtime no esta instalado. Esta version de actualizacion no lo incluye; usa el instalador completo de O2 Cloud Drive.");
+                }
+
                 progress.Report(new InstallProgress(38, "Instalando WebView2 Runtime..."));
                 await RunProcessAsync(webView2Installer, "/silent /install", [0], cancellationToken);
             }
@@ -115,10 +155,17 @@ internal static class Program
     private static bool RunSelfTest()
     {
         var names = Assembly.GetExecutingAssembly().GetManifestResourceNames().ToHashSet(StringComparer.OrdinalIgnoreCase);
-        return names.Contains("payload.zip") &&
-               names.Contains("winfsp-2.1.25156.msi") &&
-               names.Contains("MicrosoftEdgeWebView2RuntimeInstallerX64.exe") &&
-               names.Contains("O2CloudDrive.Uninstall.exe");
+        var hasRequiredResources = names.Contains("payload.zip") &&
+                                   names.Contains("O2CloudDrive.Uninstall.exe");
+
+        if (!hasRequiredResources)
+        {
+            return false;
+        }
+
+        return IsUpdateInstaller ||
+               (names.Contains("winfsp-2.1.25156.msi") &&
+                names.Contains("MicrosoftEdgeWebView2RuntimeInstallerX64.exe"));
     }
 
     internal static string NormalizeInstallDir(string path)
@@ -216,6 +263,20 @@ internal static class Program
         var outputPath = Path.Combine(targetDirectory, resourceName);
         await using var input = Assembly.GetExecutingAssembly().GetManifestResourceStream(resourceName)
             ?? throw new InvalidOperationException($"No se encontro el recurso embebido {resourceName}.");
+        await using var output = File.Create(outputPath);
+        await input.CopyToAsync(output, cancellationToken);
+        return outputPath;
+    }
+
+    private static async Task<string?> TryExtractResourceAsync(string resourceName, string targetDirectory, CancellationToken cancellationToken)
+    {
+        await using var input = Assembly.GetExecutingAssembly().GetManifestResourceStream(resourceName);
+        if (input is null)
+        {
+            return null;
+        }
+
+        var outputPath = Path.Combine(targetDirectory, resourceName);
         await using var output = File.Create(outputPath);
         await input.CopyToAsync(output, cancellationToken);
         return outputPath;

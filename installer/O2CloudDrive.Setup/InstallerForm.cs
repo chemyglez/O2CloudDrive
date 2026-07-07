@@ -20,7 +20,7 @@ internal sealed class InstallerForm : Form
         _scale = Math.Max(1F, graphics.DpiX / 96F);
 
         AutoScaleMode = AutoScaleMode.None;
-        Text = "O2 Cloud Drive 0.8.3 beta";
+        Text = Program.WindowTitle;
         ClientSize = ScaledSize(760, 330);
         MinimumSize = SizeFromClientSize(ClientSize);
         FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -47,7 +47,7 @@ internal sealed class InstallerForm : Form
         _titleLabel = new Label
         {
             AutoSize = false,
-            Text = "Instalar O2 Cloud Drive",
+            Text = Program.MainHeading,
             Font = new Font("Segoe UI Semibold", 12.5F, FontStyle.Bold),
             ForeColor = Color.FromArgb(17, 31, 44),
             Location = ScaledPoint(82, 25),
@@ -98,7 +98,7 @@ internal sealed class InstallerForm : Form
             Visible = false
         };
 
-        _installButton = CreatePrimaryButton("Instalar");
+        _installButton = CreatePrimaryButton(Program.PrimaryActionText);
         _installButton.Location = ScaledPoint(468, 270);
         _installButton.Click += OnInstallClicked;
 
@@ -196,7 +196,7 @@ internal sealed class InstallerForm : Form
         {
             await Program.InstallAsync(installDir, progress, CancellationToken.None);
             ExitCode = 0;
-            _titleLabel.Text = "Instalacion completada";
+            _titleLabel.Text = Program.CompletedHeading;
             _statusLabel.Text = NeedsReboot
                 ? "Instalado. Reinicia Windows antes de montar la unidad."
                 : "O2 Cloud Drive esta listo para usar.";
@@ -205,7 +205,7 @@ internal sealed class InstallerForm : Form
             MessageBox.Show(
                 NeedsReboot
                     ? "O2 Cloud Drive 0.8.3 beta se ha instalado correctamente. WinFsp ha pedido reiniciar Windows antes de montar unidades."
-                    : "O2 Cloud Drive 0.8.3 beta se ha instalado correctamente.",
+                    : Program.CompletedMessage,
                 "O2 Cloud Drive",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);

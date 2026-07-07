@@ -16,8 +16,8 @@
 
   <ItemGroup>
     <EmbeddedResource Include="Assets\payload.zip" LogicalName="payload.zip" />
-    <EmbeddedResource Include="Assets\winfsp-2.1.25156.msi" LogicalName="winfsp-2.1.25156.msi" />
-    <EmbeddedResource Include="Assets\MicrosoftEdgeWebView2RuntimeInstallerX64.exe" LogicalName="MicrosoftEdgeWebView2RuntimeInstallerX64.exe" />
+    <EmbeddedResource Include="Assets\winfsp-2.1.25156.msi" LogicalName="winfsp-2.1.25156.msi" Condition="Exists('Assets\winfsp-2.1.25156.msi')" />
+    <EmbeddedResource Include="Assets\MicrosoftEdgeWebView2RuntimeInstallerX64.exe" LogicalName="MicrosoftEdgeWebView2RuntimeInstallerX64.exe" Condition="Exists('Assets\MicrosoftEdgeWebView2RuntimeInstallerX64.exe')" />
     <EmbeddedResource Include="Assets\O2CloudDrive.Uninstall.exe" LogicalName="O2CloudDrive.Uninstall.exe" />
   </ItemGroup>
 </Project>

@@ -1,6 +1,8 @@
 param(
     [switch]$SkipPublish,
     [switch]$SkipSigning,
+    [ValidateSet("Full", "Update", "UpdateNet8")]
+    [string]$Variant = "Full",
     [string]$SignToolPath,
     [string]$CertificateThumbprint,
     [string]$CertificatePath,
@@ -12,13 +14,26 @@ $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $PSScriptRoot
 $PackageLabel = "0.8.3-beta"
-$PublishDir = Join-Path $Root "dist\O2CloudDrive-$PackageLabel-win-x64"
+$variantSuffix = switch ($Variant) {
+    "Full" { "" }
+    "Update" { "-update" }
+    "UpdateNet8" { "-update-net8" }
+}
+$artifactName = switch ($Variant) {
+    "Full" { "O2CloudDrive-$PackageLabel-Setup.exe" }
+    "Update" { "O2CloudDrive-$PackageLabel-Update.exe" }
+    "UpdateNet8" { "O2CloudDrive-$PackageLabel-Update-Net8.exe" }
+}
+$includePrerequisites = $Variant -eq "Full"
+$frameworkDependent = $Variant -eq "UpdateNet8"
+$selfContained = if ($frameworkDependent) { "false" } else { "true" }
+$PublishDir = Join-Path $Root "dist\O2CloudDrive-$PackageLabel-win-x64$variantSuffix"
 $SetupProject = Join-Path $PSScriptRoot "O2CloudDrive.Setup\O2CloudDrive.Setup.csproj"
 $UninstallProject = Join-Path $PSScriptRoot "O2CloudDrive.Uninstall\O2CloudDrive.Uninstall.csproj"
-$SetupPublishDir = Join-Path $Root "dist\setup-publish"
-$UninstallPublishDir = Join-Path $Root "dist\uninstall-publish"
-$SetupExe = Join-Path $Root "dist\O2CloudDrive-$PackageLabel-Setup.exe"
-$HashFile = Join-Path $Root "dist\O2CloudDrive-$PackageLabel-Setup.sha256.txt"
+$SetupPublishDir = Join-Path $Root "dist\setup-publish$variantSuffix"
+$UninstallPublishDir = Join-Path $Root "dist\uninstall-publish$variantSuffix"
+$SetupExe = Join-Path $Root "dist\$artifactName"
+$HashFile = Join-Path $Root "dist\$([System.IO.Path]::GetFileNameWithoutExtension($artifactName)).sha256.txt"
 $Project = Join-Path $Root "src\O2CloudDrive\O2CloudDrive.csproj"
 $Dotnet = Join-Path $Root ".dotnet\dotnet.exe"
 $Prereqs = Join-Path $PSScriptRoot "prereqs"
@@ -110,8 +125,23 @@ else {
     Write-Host "Firma digital omitida: no se ha indicado certificado."
 }
 
+Write-Host "Variante: $Variant"
+if ($includePrerequisites) {
+    Write-Host "Prerrequisitos incluidos: WinFsp y WebView2."
+}
+else {
+    Write-Host "Prerrequisitos omitidos: WinFsp y WebView2 deben estar instalados."
+}
+
+if ($frameworkDependent) {
+    Write-Host "Runtime .NET omitido: requiere .NET 8 Desktop Runtime instalado."
+}
+else {
+    Write-Host "Publicacion autocontenida: no requiere .NET instalado en el sistema."
+}
+
 if (-not $SkipPublish) {
-    & $Dotnet publish $Project -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:PublishReadyToRun=false -o $PublishDir
+    & $Dotnet publish $Project -c Release -r win-x64 --self-contained $selfContained -p:PublishSingleFile=false -p:PublishReadyToRun=false -o $PublishDir
     if ($LASTEXITCODE -ne 0) {
         throw "dotnet publish de O2CloudDrive fallo."
     }
@@ -122,33 +152,35 @@ if (-not (Test-Path -LiteralPath (Join-Path $PublishDir "O2CloudDrive.exe"))) {
 }
 Invoke-CodeSign -FilePath (Join-Path $PublishDir "O2CloudDrive.exe")
 
-New-Item -ItemType Directory -Force -Path $Prereqs | Out-Null
+if ($includePrerequisites) {
+    New-Item -ItemType Directory -Force -Path $Prereqs | Out-Null
 
-$winFspMsi = Join-Path $Prereqs "winfsp-2.1.25156.msi"
-if (-not (Test-Path -LiteralPath $winFspMsi) -or (Get-Item -LiteralPath $winFspMsi).Length -eq 0) {
-    & curl.exe -L --fail --retry 3 --retry-delay 2 --output $winFspMsi "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi"
-    if ($LASTEXITCODE -ne 0) {
-        throw "No se pudo descargar WinFsp."
-    }
-}
-
-$webView2Installer = Join-Path $Prereqs "MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
-if (-not (Test-Path -LiteralPath $webView2Installer) -or (Get-Item -LiteralPath $webView2Installer).Length -eq 0) {
-    $tempDownload = "$webView2Installer.download"
-    Remove-Item -LiteralPath $tempDownload -Force -ErrorAction SilentlyContinue
-    & curl.exe -L --fail --retry 3 --retry-delay 2 --output $tempDownload "https://go.microsoft.com/fwlink/?linkid=2124701"
-    if ($LASTEXITCODE -ne 0) {
-        throw "No se pudo descargar WebView2 Runtime."
+    $winFspMsi = Join-Path $Prereqs "winfsp-2.1.25156.msi"
+    if (-not (Test-Path -LiteralPath $winFspMsi) -or (Get-Item -LiteralPath $winFspMsi).Length -eq 0) {
+        & curl.exe -L --fail --retry 3 --retry-delay 2 --output $winFspMsi "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi"
+        if ($LASTEXITCODE -ne 0) {
+            throw "No se pudo descargar WinFsp."
+        }
     }
 
-    Move-Item -LiteralPath $tempDownload -Destination $webView2Installer -Force
+    $webView2Installer = Join-Path $Prereqs "MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
+    if (-not (Test-Path -LiteralPath $webView2Installer) -or (Get-Item -LiteralPath $webView2Installer).Length -eq 0) {
+        $tempDownload = "$webView2Installer.download"
+        Remove-Item -LiteralPath $tempDownload -Force -ErrorAction SilentlyContinue
+        & curl.exe -L --fail --retry 3 --retry-delay 2 --output $tempDownload "https://go.microsoft.com/fwlink/?linkid=2124701"
+        if ($LASTEXITCODE -ne 0) {
+            throw "No se pudo descargar WebView2 Runtime."
+        }
+
+        Move-Item -LiteralPath $tempDownload -Destination $webView2Installer -Force
+    }
 }
 
 Remove-Item -LiteralPath $Assets -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Assets | Out-Null
 
 Remove-Item -LiteralPath $UninstallPublishDir -Recurse -Force -ErrorAction SilentlyContinue
-& $Dotnet publish $UninstallProject -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:PublishReadyToRun=false -p:DebugType=None -p:DebugSymbols=false -o $UninstallPublishDir
+& $Dotnet publish $UninstallProject -c Release -r win-x64 --self-contained $selfContained -p:PublishSingleFile=true -p:PublishReadyToRun=false -p:DebugType=None -p:DebugSymbols=false -o $UninstallPublishDir
 if ($LASTEXITCODE -ne 0) {
     throw "dotnet publish del desinstalador fallo."
 }
@@ -167,19 +199,53 @@ Remove-Item -LiteralPath (Join-Path $PayloadSource "LEEME.txt") -Force -ErrorAct
 Remove-Item -LiteralPath $PayloadZip -Force -ErrorAction SilentlyContinue
 Compress-Archive -Path (Join-Path $PayloadSource "*") -DestinationPath $PayloadZip -CompressionLevel Optimal
 
-Copy-Item -LiteralPath $winFspMsi -Destination (Join-Path $Assets "winfsp-2.1.25156.msi") -Force
-Copy-Item -LiteralPath $webView2Installer -Destination (Join-Path $Assets "MicrosoftEdgeWebView2RuntimeInstallerX64.exe") -Force
+if ($includePrerequisites) {
+    Copy-Item -LiteralPath $winFspMsi -Destination (Join-Path $Assets "winfsp-2.1.25156.msi") -Force
+    Copy-Item -LiteralPath $webView2Installer -Destination (Join-Path $Assets "MicrosoftEdgeWebView2RuntimeInstallerX64.exe") -Force
+}
 Copy-Item -LiteralPath $uninstallerExe -Destination (Join-Path $Assets "O2CloudDrive.Uninstall.exe") -Force
 
 Remove-Item -LiteralPath $SetupPublishDir -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $SetupExe -Force -ErrorAction SilentlyContinue
 
-& $Dotnet publish $SetupProject -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:PublishReadyToRun=false -p:DebugType=None -p:DebugSymbols=false -o $SetupPublishDir
+$setupAssemblyName = [System.IO.Path]::GetFileNameWithoutExtension($artifactName)
+$setupDefines = @()
+if (-not $includePrerequisites) {
+    $setupDefines += "UPDATE_INSTALLER"
+}
+
+if ($frameworkDependent) {
+    $setupDefines += "FRAMEWORK_DEPENDENT_INSTALLER"
+}
+
+$setupPublishArgs = @(
+    "publish",
+    $SetupProject,
+    "-c",
+    "Release",
+    "-r",
+    "win-x64",
+    "--self-contained",
+    $selfContained,
+    "-p:PublishSingleFile=true",
+    "-p:PublishReadyToRun=false",
+    "-p:DebugType=None",
+    "-p:DebugSymbols=false",
+    "-p:AssemblyName=$setupAssemblyName",
+    "-o",
+    $SetupPublishDir
+)
+
+if ($setupDefines.Count -gt 0) {
+    $setupPublishArgs += "-p:DefineConstants=$($setupDefines -join '%3B')"
+}
+
+& $Dotnet @setupPublishArgs
 if ($LASTEXITCODE -ne 0) {
     throw "dotnet publish del instalador fallo."
 }
 
-$publishedSetupExe = Join-Path $SetupPublishDir "O2CloudDrive-0.8.3-beta-Setup.exe"
+$publishedSetupExe = Join-Path $SetupPublishDir "$setupAssemblyName.exe"
 if (-not (Test-Path -LiteralPath $publishedSetupExe)) {
     throw "No se encontro el ejecutable publicado del instalador."
 }

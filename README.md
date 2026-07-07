@@ -32,6 +32,11 @@ dist\O2CloudDrive-0.8.3-beta-Setup.exe
 
 Ese instalador no necesita que el equipo tenga .NET 8 instalado. Incluye la app autocontenida, WinFsp y Microsoft Edge WebView2 Runtime x64. Al ejecutarlo pedira permisos de administrador porque WinFsp instala un driver de sistema. Si WinFsp o WebView2 ya existen en el equipo, el instalador los omite.
 
+Tambien se publican variantes para actualizar equipos que ya tienen las dependencias:
+
+- `O2CloudDrive-0.8.3-beta-Update.exe`: actualizacion sin WinFsp ni WebView2 embebidos. La app sigue siendo autocontenida, por lo que no requiere instalar .NET.
+- `O2CloudDrive-0.8.3-beta-Update-Net8.exe`: actualizacion sin WinFsp, WebView2 ni runtime .NET embebido. Requiere Microsoft .NET 8 Desktop Runtime instalado.
+
 ## Actualizaciones
 
 La aplicacion puede comprobar automaticamente las releases publicadas en GitHub al iniciar. Si hay una version nueva, muestra una notificacion y una ventana con enlace de descarga del instalador.
@@ -91,6 +96,15 @@ dist\O2CloudDrive-0.8.3-beta-Setup.sha256.txt
 ```
 
 El script descarga los prerrequisitos oficiales si no estan ya en `installer\prereqs`, publica la app como autocontenida, empaqueta el payload y publica un setup unico para Windows x64.
+
+Para generar instaladores de actualizacion:
+
+```powershell
+.\installer\build-installer.ps1 -Variant Update
+.\installer\build-installer.ps1 -Variant UpdateNet8
+```
+
+La variante `Update` omite WinFsp y WebView2. La variante `UpdateNet8` tambien omite el runtime .NET y solo debe usarse en equipos con .NET 8 Desktop Runtime ya instalado.
 
 ## Firma digital
 
