@@ -93,9 +93,15 @@ public sealed class MainForm : Form
         Load += (_, _) =>
         {
             LoadInitialValues(_services.Config);
-            UpdateState(_services.AuthService.HasStoredSession()
-                ? "auth:stored-session"
-                : "Listo.");
+            var hasStoredSession = _services.AuthService.HasStoredSession();
+            UpdateState(hasStoredSession ? "auth:stored-session:checking" : "Listo.");
+            if (hasStoredSession &&
+                !_services.Config.UseSimulatedData &&
+                _services.Config.RequireAuthentication)
+            {
+                BeginInvoke(new Action(() => _ = ValidateStoredSessionOnStartupAsync()));
+            }
+
             if (_services.Config.CheckForUpdatesOnStartup)
             {
                 BeginInvoke(new Action(() => _ = CheckForUpdatesAsync(silent: true)));
@@ -772,6 +778,35 @@ public sealed class MainForm : Form
         });
     }
 
+    private async Task ValidateStoredSessionOnStartupAsync()
+    {
+        if (IsDisposed ||
+            _services.Config.UseSimulatedData ||
+            !_services.Config.RequireAuthentication ||
+            !_services.AuthService.HasStoredSession())
+        {
+            return;
+        }
+
+        try
+        {
+            var session = await Task.Run(() => _services.AuthService.EnsureAuthenticated(allowInteractive: false));
+            if (!IsDisposed)
+            {
+                UpdateState(session is { IsAuthenticated: true }
+                    ? "auth:stored-session:ok"
+                    : "auth:stored-session:expired");
+            }
+        }
+        catch
+        {
+            if (!IsDisposed)
+            {
+                UpdateState("auth:stored-session:expired");
+            }
+        }
+    }
+
     private async Task MountAsync()
     {
         if (_services.MountService.IsMounted)
@@ -1297,7 +1332,10 @@ public sealed class MainForm : Form
             "Listo." => "Preparada.",
             "update:checking" => "Actualizacion: comprobando versiones publicadas en GitHub.",
             "update:current" => "Actualizacion: la version instalada esta al dia.",
-            "auth:stored-session" => "Sesion guardada detectada en el equipo.",
+            "auth:stored-session" => "Sesion guardada encontrada; se validara antes de montar.",
+            "auth:stored-session:checking" => "Sesion guardada encontrada; validando contra O2 Cloud.",
+            "auth:stored-session:ok" => "Sesion guardada validada contra O2 Cloud.",
+            "auth:stored-session:expired" => "Sesion guardada caducada o rechazada por O2 Cloud; haz Login nuevo.",
             "auth:login:start" => "Login: abriendo navegador integrado; se conserva el estado web para que el SMS de O2 no se reinicie entre intentos.",
             "auth:login:ok" => "Login: sesion validada contra O2 Cloud.",
             "auth:logout:start" => "Logout: desmontando si hace y borrando la sesion local.",

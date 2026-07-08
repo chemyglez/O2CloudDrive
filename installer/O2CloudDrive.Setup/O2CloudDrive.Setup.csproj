@@ -7,7 +7,7 @@
     <Nullable>enable</Nullable>
     <PlatformTarget>x64</PlatformTarget>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <AssemblyName>O2CloudDrive-0.8.3-beta-Setup</AssemblyName>
+    <AssemblyName>O2CloudDrive-0.8.4-beta-Setup</AssemblyName>
     <RootNamespace>O2CloudDrive.Setup</RootNamespace>
     <ApplicationIcon>..\..\src\O2CloudDrive\Assets\O2CloudDrive.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>

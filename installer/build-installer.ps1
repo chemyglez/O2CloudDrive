@@ -13,7 +13,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $PSScriptRoot
-$PackageLabel = "0.8.3-beta"
+$PackageLabel = "0.8.4-beta"
 $variantSuffix = switch ($Variant) {
     "Full" { "" }
     "Update" { "-update" }

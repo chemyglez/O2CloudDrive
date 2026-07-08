@@ -12,6 +12,12 @@ public sealed class O2VirtualFileSystem : FileSystemBase
         string.Equals(Environment.GetEnvironmentVariable("O2CLOUD_TRACE_READS"), "1", StringComparison.Ordinal);
     private static readonly bool TraceOperations =
         string.Equals(Environment.GetEnvironmentVariable("O2CLOUD_TRACE_OPERATIONS"), "1", StringComparison.Ordinal);
+    private const long MaxErrorLogBytes = 2L * 1024L * 1024L;
+    private static readonly TimeSpan RepeatedErrorWriteInterval = TimeSpan.FromSeconds(30);
+    private static readonly object ErrorLogGate = new();
+    private static string? _lastLoggedExceptionKey;
+    private static DateTimeOffset _lastLoggedExceptionAt;
+    private static int _suppressedExceptionCount;
     private readonly ICloudFileStore _store;
     private string _volumeLabel;
 
@@ -481,18 +487,83 @@ public sealed class O2VirtualFileSystem : FileSystemBase
     {
         try
         {
-            var directory = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "O2CloudDrive",
-                "Logs");
-            Directory.CreateDirectory(directory);
-            var path = Path.Combine(directory, "filesystem-errors.log");
-            File.AppendAllText(
-                path,
-                $"{DateTimeOffset.Now:u} {exception.GetType().Name}: {exception.Message}{Environment.NewLine}{exception}{Environment.NewLine}{Environment.NewLine}");
+            lock (ErrorLogGate)
+            {
+                var now = DateTimeOffset.Now;
+                var exceptionKey = ExceptionKey(exception);
+                if (string.Equals(exceptionKey, _lastLoggedExceptionKey, StringComparison.Ordinal) &&
+                    now - _lastLoggedExceptionAt < RepeatedErrorWriteInterval)
+                {
+                    _suppressedExceptionCount++;
+                    return;
+                }
+
+                var directory = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "O2CloudDrive",
+                    "Logs");
+                Directory.CreateDirectory(directory);
+                var path = Path.Combine(directory, "filesystem-errors.log");
+                RotateErrorLogIfNeeded(path);
+
+                var text = "";
+                if (_suppressedExceptionCount > 0)
+                {
+                    text += $"{now:u} El error anterior se repitio {_suppressedExceptionCount} veces y se agrupo para no llenar el log.{Environment.NewLine}{Environment.NewLine}";
+                    _suppressedExceptionCount = 0;
+                }
+
+                text += FormatException(now, exception);
+                File.AppendAllText(path, text);
+
+                _lastLoggedExceptionKey = exceptionKey;
+                _lastLoggedExceptionAt = now;
+            }
         }
         catch
         {
+        }
+    }
+
+    private static string ExceptionKey(Exception exception)
+    {
+        var root = exception.GetBaseException();
+        return $"{exception.GetType().FullName}|{exception.Message}|{root.GetType().FullName}|{root.Message}";
+    }
+
+    private static string FormatException(DateTimeOffset timestamp, Exception exception)
+    {
+        var detail = exception.ToString();
+        if (detail.Length > 12000)
+        {
+            detail = detail[..12000] + Environment.NewLine + "... detalle recortado ...";
+        }
+
+        return $"{timestamp:u} {exception.GetType().Name}: {exception.Message}{Environment.NewLine}{detail}{Environment.NewLine}{Environment.NewLine}";
+    }
+
+    private static void RotateErrorLogIfNeeded(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return;
+        }
+
+        var length = new FileInfo(path).Length;
+        if (length < MaxErrorLogBytes)
+        {
+            return;
+        }
+
+        var backupPath = path + ".1";
+        File.Delete(backupPath);
+        if (length <= MaxErrorLogBytes * 2)
+        {
+            File.Move(path, backupPath);
+        }
+        else
+        {
+            File.Delete(path);
         }
     }
 

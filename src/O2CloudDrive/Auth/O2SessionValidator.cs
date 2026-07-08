@@ -1,3 +1,5 @@
+using System.Text.Json;
+
 namespace O2CloudDrive.Auth;
 
 public sealed class O2SessionValidator
@@ -74,10 +76,128 @@ public sealed class O2SessionValidator
             return false;
         }
 
-        return !lower.Contains("\"error\"", StringComparison.Ordinal) ||
-               (!lower.Contains("invalid", StringComparison.Ordinal) &&
-                !lower.Contains("unauthorized", StringComparison.Ordinal) &&
-                !lower.Contains("forbidden", StringComparison.Ordinal));
+        if (LooksLikeRejectedSession(lower))
+        {
+            return false;
+        }
+
+        if (TryParseRejectedJson(text, out var rejected))
+        {
+            return !rejected;
+        }
+
+        return !lower.Contains("\"error\"", StringComparison.Ordinal);
+    }
+
+    private static bool LooksLikeRejectedSession(string lower)
+    {
+        return lower.Contains("invalid", StringComparison.Ordinal) ||
+               lower.Contains("unauthorized", StringComparison.Ordinal) ||
+               lower.Contains("forbidden", StringComparison.Ordinal) ||
+               lower.Contains("login", StringComparison.Ordinal) ||
+               lower.Contains("session", StringComparison.Ordinal) && lower.Contains("expired", StringComparison.Ordinal);
+    }
+
+    private static bool TryParseRejectedJson(string text, out bool rejected)
+    {
+        rejected = false;
+        try
+        {
+            using var document = JsonDocument.Parse(text);
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                return true;
+            }
+
+            if (root.TryGetProperty("error", out var error) && IsMeaningfulError(error))
+            {
+                rejected = true;
+                return true;
+            }
+
+            var success = FirstString(root, "success");
+            if (success is not null && success.Equals("false", StringComparison.OrdinalIgnoreCase))
+            {
+                rejected = true;
+                return true;
+            }
+
+            var status = FirstString(root, "status");
+            if (status is not null &&
+                (status.Contains("error", StringComparison.OrdinalIgnoreCase) ||
+                 status.Contains("fail", StringComparison.OrdinalIgnoreCase)))
+            {
+                rejected = true;
+                return true;
+            }
+
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsMeaningfulError(JsonElement error)
+    {
+        return error.ValueKind switch
+        {
+            JsonValueKind.Null or JsonValueKind.Undefined or JsonValueKind.False => false,
+            JsonValueKind.String => !string.IsNullOrWhiteSpace(error.GetString()) &&
+                                    !IsSuccessValue(error.GetString()!),
+            JsonValueKind.Number => error.GetRawText() != "0",
+            JsonValueKind.Object => IsMeaningfulErrorObject(error),
+            JsonValueKind.Array => error.GetArrayLength() > 0,
+            _ => true,
+        };
+    }
+
+    private static bool IsMeaningfulErrorObject(JsonElement error)
+    {
+        var code = FirstString(error, "code", "errorcode", "resultcode", "statuscode");
+        if (!string.IsNullOrWhiteSpace(code) && IsSuccessValue(code))
+        {
+            return false;
+        }
+
+        var message = FirstString(error, "message", "description", "detail");
+        if (!string.IsNullOrWhiteSpace(message) && IsSuccessValue(message))
+        {
+            return false;
+        }
+
+        return error.EnumerateObject().Any();
+    }
+
+    private static string? FirstString(JsonElement element, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            if (element.ValueKind != JsonValueKind.Object || !element.TryGetProperty(name, out var property))
+            {
+                continue;
+            }
+
+            if (property.ValueKind == JsonValueKind.String)
+            {
+                return property.GetString();
+            }
+
+            if (property.ValueKind is JsonValueKind.Number or JsonValueKind.True or JsonValueKind.False)
+            {
+                return property.GetRawText();
+            }
+        }
+
+        return null;
+    }
+
+    private static bool IsSuccessValue(string value)
+    {
+        var normalized = value.Trim().ToUpperInvariant();
+        return normalized is "0" or "OK" or "SUCCESS" or "TRUE" or "COM-0000" or "COM-0";
     }
 
     private static void ApplySessionHeaders(HttpRequestMessage request, O2Session session)

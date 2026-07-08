@@ -8,8 +8,8 @@ public sealed record DriveMountOptions(string MountPoint, string VolumeLabel, bo
 
 public sealed class O2DriveMountService : IDisposable
 {
-    private static readonly TimeSpan KeepAliveInitialDelay = TimeSpan.FromMinutes(1);
-    private static readonly TimeSpan KeepAliveInterval = TimeSpan.FromMinutes(3);
+    private static readonly TimeSpan KeepAliveInitialDelay = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan KeepAliveInterval = TimeSpan.FromMinutes(1);
     private readonly object _gate = new();
     private readonly IO2CloudApiClient _apiClient;
     private readonly ReadCacheOptions _readCacheOptions;
@@ -155,6 +155,10 @@ public sealed class O2DriveMountService : IDisposable
         try
         {
             _apiClient.KeepSessionAlive();
+        }
+        catch
+        {
+            // Keep-alive is best effort; filesystem operations will surface a real session error if O2 rejects it.
         }
         finally
         {

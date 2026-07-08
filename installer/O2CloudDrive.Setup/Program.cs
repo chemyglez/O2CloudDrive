@@ -10,7 +10,7 @@ namespace O2CloudDrive.Setup;
 internal static class Program
 {
     private const string ProductName = "O2 Cloud Drive";
-    private const string DisplayVersion = "0.8.3 beta";
+    private const string DisplayVersion = "0.8.4 beta";
     private const string Publisher = "Chemys";
     private const string WebView2ClientKey = @"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
     private const string UninstallKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\O2CloudDrive";
@@ -37,8 +37,8 @@ internal static class Program
 #endif
 
     internal static string WindowTitle => IsUpdateInstaller
-        ? "O2 Cloud Drive 0.8.3 beta - Actualizacion"
-        : "O2 Cloud Drive 0.8.3 beta";
+        ? "O2 Cloud Drive 0.8.4 beta - Actualizacion"
+        : "O2 Cloud Drive 0.8.4 beta";
 
     internal static string MainHeading => IsUpdateInstaller
         ? "Actualizar O2 Cloud Drive"
@@ -52,7 +52,7 @@ internal static class Program
 
     internal static string CompletedMessage => IsUpdateInstaller
         ? "O2 Cloud Drive se ha actualizado correctamente."
-        : "O2 Cloud Drive 0.8.3 beta se ha instalado correctamente.";
+        : "O2 Cloud Drive 0.8.4 beta se ha instalado correctamente.";
 
     [STAThread]
     private static int Main(string[] args)

@@ -51,6 +51,10 @@ public sealed class AuthService : IAuthService
                 _currentSession = environmentSession;
                 return _currentSession;
             }
+            else if (environmentSession is not null)
+            {
+                ClearEnvironmentSession();
+            }
 
             var storedSession = _sessionStore.TryRead();
             if (Validate(storedSession))
