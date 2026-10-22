@@ -21,6 +21,12 @@ public interface IO2CloudApiClient
     O2CloudItemDto CreateFolder(string parentFolderId, string name);
     O2CloudItemDto UploadFile(string parentFolderId, string name, byte[] content);
     O2CloudItemDto UploadFile(string parentFolderId, string name, Stream content, long contentLength);
+    O2CloudItemDto ReplaceFile(
+        O2CloudItemDto previous,
+        string parentFolderId,
+        string name,
+        Stream content,
+        long contentLength);
     void RenameOrMove(O2CloudItemDto item, string newName, string parentFolderId);
     void MoveToTrash(O2CloudItemDto item);
     O2CloudItemDto RestoreFromTrash(O2CloudItemDto item);
@@ -43,6 +49,10 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
     private const long AsyncUploadThresholdBytes = 200L * 1024L * 1024L;
     private static readonly TimeSpan UploadStallTimeout = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan UploadResponseTimeout = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan RemoteConfirmationTimeout = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan RemoteConfirmationRetryDelay = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan MetadataRequestTimeout = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan DownloadRangeTimeout = TimeSpan.FromSeconds(60);
     private static readonly string[] MediaListFields =
     [
         "name",
@@ -104,7 +114,7 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
     private readonly HttpClient _httpClient;
     private readonly IAuthService _authService;
     private readonly Uri _baseUri;
-    private readonly object _authenticatedRequestGate = new();
+    private readonly SemaphoreSlim _authenticatedRequestGate = new(1, 1);
 
     public event EventHandler<O2TransferProgress>? TransferProgress;
     private readonly object _folderIdGate = new();
@@ -222,14 +232,39 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
 
     public IReadOnlyList<O2CloudItemDto> ListFolder(string folderId)
     {
+        return ListFolder(folderId, CancellationToken.None);
+    }
+
+    private IReadOnlyList<O2CloudItemDto> ListFolder(
+        string folderId,
+        CancellationToken cancellationToken,
+        bool? isFolder = null)
+    {
         Exception? lastError = null;
         List<O2CloudItemDto>? firstEmptyResult = null;
 
         foreach (var candidate in KnownFolderIdCandidates(folderId))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                var items = LoadFolder(candidate);
+                List<O2CloudItemDto> items;
+                if (isFolder is null)
+                {
+                    items = LoadFolder(candidate, cancellationToken);
+                }
+                else
+                {
+                    items = [];
+                    if (isFolder.Value)
+                    {
+                        LoadFolders(candidate, items, cancellationToken);
+                    }
+                    else
+                    {
+                        LoadFiles(candidate, items, cancellationToken);
+                    }
+                }
                 if (items.Count > 0)
                 {
                     return SortItems(items);
@@ -253,18 +288,24 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
 
     public IReadOnlyList<O2CloudItemDto> ListTrash()
     {
+        return ListTrash(CancellationToken.None);
+    }
+
+    private IReadOnlyList<O2CloudItemDto> ListTrash(CancellationToken cancellationToken)
+    {
         var output = new List<O2CloudItemDto>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         string? cursor = null;
 
         for (var page = 0; page < 10; page++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             try
             {
                 using var document = SendJson(HttpMethod.Post, "media/trash", new Dictionary<string, string?>
                 {
                     ["action"] = "get",
-                }, TrashListPayload(cursor));
+                }, TrashListPayload(cursor), cancellationToken);
 
                 var items = ParseTrashItems(document.RootElement);
                 foreach (var item in items)
@@ -295,10 +336,11 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
 
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             using var document = SendJson(HttpMethod.Post, "media/trash", new Dictionary<string, string?>
             {
                 ["action"] = "get",
-            });
+            }, cancellationToken: cancellationToken);
 
             return SortItems(ParseTrashItems(document.RootElement));
         }
@@ -346,6 +388,16 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         if (item.IsFolder || length == 0)
         {
             return [];
+        }
+
+        if (item.Size > 0)
+        {
+            if (offset >= (ulong)item.Size)
+            {
+                return [];
+            }
+
+            length = (uint)Math.Min(length, (ulong)item.Size - offset);
         }
 
         var attempted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -748,13 +800,15 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
 
     private byte[] DownloadRange(string rawUrl, string fileName, ulong offset, uint length)
     {
+        using var timeout = new CancellationTokenSource(DownloadRangeTimeout);
+        var cancellationToken = timeout.Token;
         var uri = NormalizeDownloadUri(rawUrl, fileName);
         using var request = new HttpRequestMessage(HttpMethod.Get, uri);
         ApplySessionHeaders(request, includeCookies: O2SessionRequest.IsSameOrigin(uri, _baseUri));
         request.Headers.TryAddWithoutValidation("Accept", "*/*");
         request.Headers.Range = new RangeHeaderValue((long)offset, checked((long)(offset + length - 1)));
 
-        using var response = _httpClient.Send(request, HttpCompletionOption.ResponseHeadersRead);
+        using var response = _httpClient.Send(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         if (response.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
         {
             TraceDownload(uri, response.StatusCode, offset, length, 0);
@@ -762,14 +816,26 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         }
 
         response.EnsureSuccessStatusCode();
-        if (response.StatusCode != HttpStatusCode.PartialContent && offset > 0)
+        var range = response.Content.Headers.ContentRange;
+        var validPartialRange = response.StatusCode == HttpStatusCode.PartialContent &&
+            range is { HasRange: true } &&
+            range.Unit.Equals("bytes", StringComparison.OrdinalIgnoreCase) &&
+            range.From == (long)offset &&
+            range.To == checked((long)(offset + length - 1));
+        var validWholeFile = response.StatusCode == HttpStatusCode.OK &&
+            offset == 0 && response.Content.Headers.ContentLength == length;
+        if (!validPartialRange && !validWholeFile)
         {
             TraceDownload(uri, response.StatusCode, offset, length, 0);
-            throw new HttpRequestException("La URL de descarga no soporta Range.", null, response.StatusCode);
+            throw new HttpRequestException("O2 Cloud no devolvio el rango de bytes solicitado.", null, response.StatusCode);
         }
 
-        using var stream = response.Content.ReadAsStream();
-        var bytes = ReadAtMost(stream, length);
+        using var stream = response.Content.ReadAsStream(cancellationToken);
+        var bytes = ReadAtMost(stream, length, cancellationToken);
+        if (bytes.Length != length)
+        {
+            throw new HttpRequestException("O2 Cloud interrumpio la descarga antes de completar el rango solicitado.");
+        }
         TraceDownload(uri, response.StatusCode, offset, length, bytes.Length);
         return bytes;
     }
@@ -784,24 +850,26 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             request.Headers.TryAddWithoutValidation("Accept", "*/*");
             request.Headers.Range = new RangeHeaderValue(0, 1023);
 
-            using var response = _httpClient.Send(request, HttpCompletionOption.ResponseHeadersRead);
+            using var timeout = new CancellationTokenSource(MetadataRequestTimeout);
+            using var response = _httpClient.Send(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
             TraceDownload(uri, response.StatusCode, 0, 1024, 0);
             return response.StatusCode;
         }
-        catch (Exception ex) when (ex is HttpRequestException or UriFormatException or InvalidOperationException)
+        catch (Exception ex) when (ex is HttpRequestException or UriFormatException or InvalidOperationException or OperationCanceledException)
         {
             return null;
         }
     }
 
-    private static byte[] ReadAtMost(Stream stream, uint length)
+    private static byte[] ReadAtMost(Stream stream, uint length, CancellationToken cancellationToken)
     {
         var requested = checked((int)Math.Min(length, int.MaxValue));
         var buffer = new byte[requested];
         var total = 0;
         while (total < buffer.Length)
         {
-            var read = stream.Read(buffer, total, buffer.Length - total);
+            var read = stream.ReadAsync(buffer.AsMemory(total, buffer.Length - total), cancellationToken)
+                .AsTask().GetAwaiter().GetResult();
             if (read == 0)
             {
                 break;
@@ -895,8 +963,16 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         }
     }
 
-    private O2CloudItemDto UploadFileCore(string parentFolderId, string name, Stream content, long contentLength)
+    private O2CloudItemDto UploadFileCore(
+        string parentFolderId,
+        string name,
+        Stream content,
+        long contentLength,
+        string? progressFileName = null,
+        bool reportCompletion = true,
+        bool allowUniqueNameConfirmation = false)
     {
+        var transferName = progressFileName ?? name;
         var metadata = new Dictionary<string, object?>
         {
             ["name"] = name,
@@ -942,7 +1018,7 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             Timeout.InfiniteTimeSpan);
         long lastUploadProgressBytes = 0;
 
-        ReportTransfer("start", name, 0, contentLength);
+        ReportTransfer("start", transferName, 0, contentLength);
         var fileContent = new ProgressStreamContent(
             content,
             contentLength,
@@ -957,7 +1033,7 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
                     stallTimer.Change(timeout, Timeout.InfiniteTimeSpan);
                 }
 
-                ReportTransfer("progress", name, sent, total, bytesPerSecond);
+                ReportTransfer("progress", transferName, sent, total, bytesPerSecond);
             });
         fileContent.Headers.ContentLength = contentLength;
         if (!string.IsNullOrWhiteSpace(contentType))
@@ -970,7 +1046,6 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
 
         using var response = SendUploadRequest(request, uploadCancellation.Token);
         stallTimer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
-        var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
         if (response.StatusCode == HttpStatusCode.Unauthorized)
         {
             _authService.InvalidateSessionIfCurrent(session);
@@ -982,19 +1057,39 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             throw new UnauthorizedAccessException("O2 Cloud rechazo la subida porque la sesion no esta autorizada.");
         }
 
+        // ResponseHeadersRead does not include the response body in HttpClient's timeout.
+        // The upload timer is stopped above, so bound this small metadata response too.
+        string text;
+        using (var responseTimeout = new CancellationTokenSource(MetadataRequestTimeout))
+        {
+            try
+            {
+                text = response.Content.ReadAsStringAsync(responseTimeout.Token).GetAwaiter().GetResult();
+            }
+            catch (OperationCanceledException ex) when (responseTimeout.IsCancellationRequested)
+            {
+                throw new TimeoutException(
+                    "O2 Cloud recibio los datos, pero no termino de enviar la respuesta de la subida. La copia local se conserva.",
+                    ex);
+            }
+        }
+
         if (useAsyncUpload &&
             response.StatusCode is HttpStatusCode.BadGateway or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout)
         {
-            ReportTransfer("confirming", name, contentLength, contentLength);
+            ReportTransfer("confirming", transferName, contentLength, contentLength);
             var confirmedAfterTimeout = FindChildWithRetries(
                 parentFolderId,
                 name,
                 isFolder: false,
                 expectedSize: contentLength,
-                onRetry: seconds => ReportTransfer("waiting", name, seconds, contentLength));
+                onRetry: seconds => ReportTransfer("waiting", transferName, seconds, contentLength));
             if (confirmedAfterTimeout is not null)
             {
-                ReportTransfer("completed", name, contentLength, contentLength);
+                if (reportCompletion)
+                {
+                    ReportTransfer("completed", transferName, contentLength, contentLength);
+                }
                 return confirmedAfterTimeout;
             }
 
@@ -1007,7 +1102,7 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             throw new IOException($"O2 Cloud rechazo la subida HTTP {(int)response.StatusCode}: {TrimPreview(text)}");
         }
 
-        ReportTransfer("confirming", name, contentLength, contentLength);
+        ReportTransfer("confirming", transferName, contentLength, contentLength);
         JsonDocument? document;
         try
         {
@@ -1028,10 +1123,13 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
                     name,
                     isFolder: false,
                     expectedSize: contentLength,
-                    onRetry: seconds => ReportTransfer("waiting", name, seconds, contentLength));
+                    onRetry: seconds => ReportTransfer("waiting", transferName, seconds, contentLength));
                 if (listedAfterAcceptedText is not null)
                 {
-                    ReportTransfer("completed", name, contentLength, contentLength);
+                    if (reportCompletion)
+                    {
+                        ReportTransfer("completed", transferName, contentLength, contentLength);
+                    }
                     return listedAfterAcceptedText;
                 }
 
@@ -1052,21 +1150,19 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
                     isFolder: false,
                     expectedSize: contentLength,
                     expectedId: uploaded.Id,
-                    onRetry: seconds => ReportTransfer("waiting", name, seconds, contentLength));
-                confirmed ??= FindChildWithRetries(
-                    parentFolderId,
-                    name,
-                    isFolder: false,
-                    expectedSize: contentLength,
-                    onRetry: seconds => ReportTransfer("waiting", name, seconds, contentLength));
+                    allowUniqueNameFallback: allowUniqueNameConfirmation,
+                    onRetry: seconds => ReportTransfer("waiting", transferName, seconds, contentLength));
                 if (confirmed is not null)
                 {
-                    ReportTransfer("completed", name, contentLength, contentLength);
+                    if (reportCompletion)
+                    {
+                        ReportTransfer("completed", transferName, contentLength, contentLength);
+                    }
                     return confirmed;
                 }
 
-                ReportTransfer("completed", name, contentLength, contentLength);
-                return uploaded;
+                throw new IOException(
+                    "O2 Cloud devolvio un identificador para la subida, pero el archivo no aparece confirmado con el nombre y tamano esperados.");
             }
 
             O2CloudItemDto? listed = null;
@@ -1078,7 +1174,7 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
                     name,
                     isFolder: false,
                     expectedSize: contentLength,
-                    onRetry: seconds => ReportTransfer("waiting", name, seconds, contentLength));
+                    onRetry: seconds => ReportTransfer("waiting", transferName, seconds, contentLength));
             }
             catch (Exception ex) when (ex is InvalidOperationException or HttpRequestException or IOException)
             {
@@ -1087,7 +1183,10 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
 
             if (listed is not null)
             {
-                ReportTransfer("completed", name, contentLength, contentLength);
+                if (reportCompletion)
+                {
+                    ReportTransfer("completed", transferName, contentLength, contentLength);
+                }
                 return listed;
             }
 
@@ -1100,6 +1199,163 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
                 ? new InvalidOperationException("O2 Cloud recibio la subida, pero no devolvio confirmacion ni el archivo aparece al refrescar la carpeta.")
                 : new IOException("O2 Cloud recibio la subida, pero fallo al comprobar el listado de la carpeta.", listingException);
         }
+    }
+
+    public O2CloudItemDto ReplaceFile(
+        O2CloudItemDto previous,
+        string parentFolderId,
+        string name,
+        Stream content,
+        long contentLength)
+    {
+        try
+        {
+            return ReplaceFileCore(previous, parentFolderId, name, content, contentLength);
+        }
+        catch (Exception ex)
+        {
+            ReportTransfer("failed", name, 0, contentLength, message: UploadFailureMessage(ex));
+            throw;
+        }
+    }
+
+    private O2CloudItemDto ReplaceFileCore(
+        O2CloudItemDto previous,
+        string parentFolderId,
+        string name,
+        Stream content,
+        long contentLength)
+    {
+        if (previous.IsFolder)
+        {
+            throw new IOException("No se puede sustituir el contenido de una carpeta.");
+        }
+
+        if (IsPendingUploadId(previous.Id))
+        {
+            previous = ResolvePendingUploadForMutation(previous);
+        }
+
+        previous = FindChildWithRetries(
+            parentFolderId,
+            name,
+            isFolder: false,
+            expectedSize: null,
+            expectedId: previous.Id)
+            ?? throw new IOException(
+                "O2 Cloud no pudo localizar por identificador el archivo original antes de sustituirlo.");
+
+        var transactionId = Guid.NewGuid().ToString("N");
+        var temporaryName = ReplacementFileName("new", transactionId, name);
+        var backupName = ReplacementFileName("old", transactionId, name);
+        var uploaded = UploadFileCore(
+            parentFolderId,
+            temporaryName,
+            content,
+            contentLength,
+            progressFileName: name,
+            reportCompletion: false,
+            allowUniqueNameConfirmation: true);
+        if (uploaded.Id.Equals(previous.Id, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new IOException("O2 Cloud devolvio el identificador del archivo anterior al confirmar la nueva version.");
+        }
+
+        var oldRenamed = false;
+        var newPromoted = false;
+        var backup = previous with { Name = backupName, ParentId = parentFolderId };
+        var promoted = uploaded with { Name = name, ParentId = parentFolderId };
+
+        try
+        {
+            oldRenamed = true;
+            backup = RenameAndConfirm(previous, backupName, parentFolderId, previous.Size);
+
+            newPromoted = true;
+            promoted = RenameAndConfirm(uploaded, name, parentFolderId, contentLength);
+        }
+        catch (Exception replacementError)
+        {
+            var rollbackErrors = new List<Exception>();
+
+            if (newPromoted)
+            {
+                try
+                {
+                    uploaded = RenameAndConfirm(promoted, temporaryName, parentFolderId, contentLength);
+                    newPromoted = false;
+                }
+                catch (Exception rollbackError)
+                {
+                    rollbackErrors.Add(rollbackError);
+                }
+            }
+
+            if (oldRenamed)
+            {
+                try
+                {
+                    _ = RenameAndConfirm(backup, name, parentFolderId, previous.Size);
+                    oldRenamed = false;
+                }
+                catch (Exception rollbackError)
+                {
+                    rollbackErrors.Add(rollbackError);
+                }
+            }
+
+            if (!oldRenamed && !newPromoted)
+            {
+                try
+                {
+                    MoveToTrash(uploaded);
+                }
+                catch
+                {
+                    // The temporary copy is intentionally preserved if cleanup is not certain.
+                }
+            }
+
+            if (rollbackErrors.Count > 0)
+            {
+                throw new IOException(
+                    "La sustitucion fallo y O2 Cloud no pudo restaurar por completo el estado anterior. La copia local se conserva para reintentar.",
+                    new AggregateException([replacementError, .. rollbackErrors]));
+            }
+
+            throw new IOException(
+                "O2 Cloud no pudo sustituir el archivo. El objeto anterior se restauro y la copia local se conserva para reintentar.",
+                replacementError);
+        }
+
+        var cleanupWarning = false;
+        try
+        {
+            MoveToTrash(backup);
+        }
+        catch
+        {
+            try
+            {
+                cleanupWarning = FindActiveFileById(parentFolderId, previous.Id) is not null;
+            }
+            catch
+            {
+                cleanupWarning = true;
+            }
+        }
+
+        RemoveCachedDownloadUrl(previous.Id);
+        RemoveCachedDownloadUrl(promoted.Id);
+        ReportTransfer(
+            cleanupWarning ? "warning" : "completed",
+            name,
+            contentLength,
+            contentLength,
+            message: cleanupWarning
+                ? "La nueva version quedo confirmada, pero no se pudo retirar automaticamente la copia anterior renombrada."
+                : null);
+        return promoted;
     }
 
     public void RenameOrMove(O2CloudItemDto item, string newName, string parentFolderId)
@@ -1439,7 +1695,10 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         FirstSuccess(operations.ToArray());
     }
 
-    private void LoadFolders(string folderId, ICollection<O2CloudItemDto> items)
+    private void LoadFolders(
+        string folderId,
+        ICollection<O2CloudItemDto> items,
+        CancellationToken cancellationToken)
     {
         var currentFolderIds = KnownFolderIdCandidates(folderId).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1447,13 +1706,14 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
 
         for (var offset = 0; ; offset += PageSize)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             using var document = SendJson(HttpMethod.Get, "media/folder", new Dictionary<string, string?>
             {
                 ["action"] = "list",
                 ["parentid"] = folderId,
                 ["limit"] = PageSize.ToString(CultureInfo.InvariantCulture),
                 ["offset"] = offset > 0 ? offset.ToString(CultureInfo.InvariantCulture) : null,
-            });
+            }, cancellationToken: cancellationToken);
 
             var root = document.RootElement;
             var data = ObjectProperty(root, "data");
@@ -1507,14 +1767,14 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         }
     }
 
-    private List<O2CloudItemDto> LoadFolder(string folderId)
+    private List<O2CloudItemDto> LoadFolder(string folderId, CancellationToken cancellationToken)
     {
         var items = new List<O2CloudItemDto>();
         Exception? firstError = null;
 
         try
         {
-            LoadFolders(folderId, items);
+            LoadFolders(folderId, items, cancellationToken);
         }
         catch (Exception ex) when (IsRecoverableFolderIdError(ex))
         {
@@ -1523,7 +1783,7 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
 
         try
         {
-            LoadFiles(folderId, items);
+            LoadFiles(folderId, items, cancellationToken);
         }
         catch (Exception ex) when (IsRecoverableFolderIdError(ex))
         {
@@ -1621,14 +1881,31 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         }
     }
 
-    private void LoadFiles(string folderId, ICollection<O2CloudItemDto> items)
+    private void RemoveCachedDownloadUrl(string itemId)
+    {
+        if (string.IsNullOrWhiteSpace(itemId))
+        {
+            return;
+        }
+
+        lock (_downloadUrlGate)
+        {
+            _downloadUrlCache.Remove(itemId);
+        }
+    }
+
+    private void LoadFiles(
+        string folderId,
+        ICollection<O2CloudItemDto> items,
+        CancellationToken cancellationToken)
     {
         var currentFolderIds = KnownFolderIdCandidates(folderId).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var pageSignatures = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         for (var offset = 0; ; offset += PageSize)
         {
-            using var document = SendMediaListPage(folderId, offset);
+            cancellationToken.ThrowIfCancellationRequested();
+            using var document = SendMediaListPage(folderId, offset, cancellationToken);
 
             var root = document.RootElement;
             var data = ObjectProperty(root, "data");
@@ -1712,7 +1989,10 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         }
     }
 
-    private JsonDocument SendMediaListPage(string folderId, int offset)
+    private JsonDocument SendMediaListPage(
+        string folderId,
+        int offset,
+        CancellationToken cancellationToken)
     {
         var query = new Dictionary<string, string?>
         {
@@ -1730,11 +2010,11 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
                 {
                     fields = MediaListFields,
                 },
-            });
+            }, cancellationToken);
         }
         catch (Exception ex) when (IsRecoverableFolderIdError(ex))
         {
-            return SendJson(HttpMethod.Post, "media", query);
+            return SendJson(HttpMethod.Post, "media", query, cancellationToken: cancellationToken);
         }
     }
 
@@ -1982,6 +2262,74 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         return false;
     }
 
+    private static string ReplacementFileName(string role, string transactionId, string originalName)
+    {
+        var extension = Path.GetExtension(originalName);
+        if (extension.Length > 16)
+        {
+            extension = string.Empty;
+        }
+
+        return $"~o2cd-{role}-{transactionId}{extension}";
+    }
+
+    private O2CloudItemDto RenameAndConfirm(
+        O2CloudItemDto item,
+        string newName,
+        string parentFolderId,
+        long expectedSize)
+    {
+        Exception? renameError = null;
+        try
+        {
+            RenameOrMove(item, newName, parentFolderId);
+        }
+        catch (Exception ex)
+        {
+            renameError = ex;
+        }
+
+        try
+        {
+            var confirmed = WaitForActiveFileState(parentFolderId, item.Id, newName, expectedSize);
+            if (confirmed is not null)
+            {
+                return confirmed;
+            }
+        }
+        catch (Exception confirmationError)
+        {
+            renameError = renameError is null
+                ? confirmationError
+                : new AggregateException(renameError, confirmationError);
+        }
+
+        throw new IOException(
+            $"O2 Cloud no confirmo el cambio de nombre de '{item.Name}' a '{newName}' para el identificador esperado.",
+            renameError);
+    }
+
+    private O2CloudItemDto? WaitForActiveFileState(
+        string parentFolderId,
+        string expectedId,
+        string expectedName,
+        long expectedSize)
+    {
+        return FindChildWithRetries(
+            parentFolderId,
+            expectedName,
+            isFolder: false,
+            expectedSize,
+            expectedId);
+    }
+
+    private O2CloudItemDto? FindActiveFileById(string parentFolderId, string expectedId)
+    {
+        return ListFolder(parentFolderId, CancellationToken.None, isFolder: false).FirstOrDefault(item =>
+            !item.IsFolder &&
+            item.Id.Equals(expectedId, StringComparison.OrdinalIgnoreCase));
+    }
+
     private O2CloudItemDto? FindChild(
         string parentFolderId,
         string name,
@@ -1989,16 +2337,51 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         long? expectedSize = null,
         string? expectedId = null)
     {
-        var children = ListFolder(parentFolderId);
+        return FindChildCore(
+            parentFolderId,
+            name,
+            isFolder,
+            expectedSize,
+            expectedId,
+            allowUniqueNameFallback: false,
+            cancellationToken: CancellationToken.None);
+    }
+
+    private O2CloudItemDto? FindChildCore(
+        string parentFolderId,
+        string name,
+        bool isFolder,
+        long? expectedSize,
+        string? expectedId,
+        bool allowUniqueNameFallback,
+        CancellationToken cancellationToken)
+    {
+        var children = ListFolder(parentFolderId, cancellationToken, isFolder);
         if (!string.IsNullOrWhiteSpace(expectedId))
         {
             var idMatch = children.FirstOrDefault(item =>
                 item.IsFolder == isFolder &&
                 item.Id.Equals(expectedId, StringComparison.OrdinalIgnoreCase));
-            if (idMatch is not null)
+            if (idMatch is not null &&
+                idMatch.Name.Equals(name, StringComparison.OrdinalIgnoreCase) &&
+                (expectedSize is null || idMatch.Size == expectedSize.Value))
             {
                 return idMatch;
             }
+
+            if (!allowUniqueNameFallback)
+            {
+                return null;
+            }
+
+            var uniqueMatches = children
+                .Where(item =>
+                    item.IsFolder == isFolder &&
+                    item.Name.Equals(name, StringComparison.OrdinalIgnoreCase) &&
+                    (expectedSize is null || item.Size == expectedSize.Value))
+                .Take(2)
+                .ToList();
+            return uniqueMatches.Count == 1 ? uniqueMatches[0] : null;
         }
 
         var matches = children
@@ -2007,11 +2390,7 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
 
         if (expectedSize is not null)
         {
-            var sizedMatches = matches.Where(item => item.Size == expectedSize.Value).ToList();
-            if (sizedMatches.Count > 0)
-            {
-                matches = sizedMatches;
-            }
+            matches = matches.Where(item => item.Size == expectedSize.Value).ToList();
         }
 
         return matches
@@ -2025,24 +2404,53 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         bool isFolder,
         long? expectedSize = null,
         string? expectedId = null,
+        bool allowUniqueNameFallback = false,
         Action<int>? onRetry = null)
     {
-        for (var attempt = 0; attempt < 96; attempt++)
+        using var confirmationTimeout = new CancellationTokenSource(RemoteConfirmationTimeout);
+        var cancellationToken = confirmationTimeout.Token;
+        var startedAt = DateTimeOffset.UtcNow;
+        var nextProgressSeconds = 5;
+
+        while (!cancellationToken.IsCancellationRequested)
         {
-            var match = string.IsNullOrWhiteSpace(expectedId)
-                ? FindChild(parentFolderId, name, isFolder, expectedSize)
-                : FindChild(parentFolderId, name, isFolder, expectedSize, expectedId);
+            O2CloudItemDto? match;
+            try
+            {
+                match = FindChildCore(
+                    parentFolderId,
+                    name,
+                    isFolder,
+                    expectedSize,
+                    expectedId,
+                    allowUniqueNameFallback,
+                    cancellationToken);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                match = null;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return null;
+            }
+
             if (match is not null)
             {
                 return match;
             }
 
-            if (onRetry is not null && attempt % 4 == 3)
+            var elapsedSeconds = (int)Math.Floor((DateTimeOffset.UtcNow - startedAt).TotalSeconds);
+            if (onRetry is not null && elapsedSeconds >= nextProgressSeconds)
             {
-                onRetry((attempt + 1) * 1_250 / 1_000);
+                onRetry(elapsedSeconds);
+                nextProgressSeconds += 5;
             }
 
-            Thread.Sleep(1_250);
+            if (cancellationToken.WaitHandle.WaitOne(RemoteConfirmationRetryDelay))
+            {
+                break;
+            }
         }
 
         return null;
@@ -2050,16 +2458,17 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
 
     private void VerifyMovedToTrash(O2CloudItemDto item)
     {
+        using var timeout = new CancellationTokenSource(RemoteConfirmationTimeout);
+        var cancellationToken = timeout.Token;
         Exception? lastError = null;
-        for (var attempt = 0; attempt < 16; attempt++)
+        while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
-                var trashItems = ListTrash();
+                var trashItems = ListTrash(cancellationToken);
                 if (trashItems.Any(candidate =>
                         candidate.IsFolder == item.IsFolder &&
-                        (candidate.Id.Equals(item.Id, StringComparison.OrdinalIgnoreCase) ||
-                         candidate.Name.Equals(item.Name, StringComparison.OrdinalIgnoreCase))))
+                        candidate.Id.Equals(item.Id, StringComparison.OrdinalIgnoreCase)))
                 {
                     return;
                 }
@@ -2068,8 +2477,19 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             {
                 lastError = ex;
             }
+            catch (OperationCanceledException ex)
+            {
+                lastError = ex;
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    break;
+                }
+            }
 
-            Thread.Sleep(1_000);
+            if (cancellationToken.WaitHandle.WaitOne(RemoteConfirmationRetryDelay))
+            {
+                break;
+            }
         }
 
         throw new IOException("O2 Cloud acepto el borrado, pero el elemento no aparece confirmado en la papelera remota.", lastError);
@@ -2091,10 +2511,16 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         HttpMethod method,
         string resource,
         IReadOnlyDictionary<string, string?> query,
-        object? body = null)
+        object? body = null,
+        CancellationToken cancellationToken = default)
     {
-        lock (_authenticatedRequestGate)
+        using var requestTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        requestTimeout.CancelAfter(MetadataRequestTimeout);
+        var requestToken = requestTimeout.Token;
+        _authenticatedRequestGate.Wait(requestToken);
+        try
         {
+            requestToken.ThrowIfCancellationRequested();
             var session = _authService.GetCurrentSession();
             using var request = O2SessionRequest.Create(method, _baseUri, resource, query, session);
             if (body is not null)
@@ -2102,15 +2528,19 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
                 request.Content = new StringContent(JsonSerializer.Serialize(body, JsonOptions), Encoding.UTF8, "application/json");
             }
 
-            using var response = _httpClient.Send(request);
+            using var response = _httpClient.Send(request, HttpCompletionOption.ResponseContentRead, requestToken);
             ThrowIfAuthenticationRejected(response, resource, session);
             response.EnsureSuccessStatusCode();
-            var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            var text = response.Content.ReadAsStringAsync(requestToken).GetAwaiter().GetResult();
             var document = ParseJson(text);
             ThrowIfAuthenticationRejected(document.RootElement, resource, session);
             ThrowIfO2Error(document.RootElement, text);
             RefreshValidationKey(document.RootElement, session);
             return document;
+        }
+        finally
+        {
+            _authenticatedRequestGate.Release();
         }
     }
 
@@ -2118,20 +2548,26 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         HttpMethod method,
         string resource,
         IReadOnlyDictionary<string, string?> query,
-        object body)
+        object body,
+        CancellationToken cancellationToken = default)
     {
-        lock (_authenticatedRequestGate)
+        using var requestTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        requestTimeout.CancelAfter(MetadataRequestTimeout);
+        var requestToken = requestTimeout.Token;
+        _authenticatedRequestGate.Wait(requestToken);
+        try
         {
+            requestToken.ThrowIfCancellationRequested();
             var session = _authService.GetCurrentSession();
             using var request = O2SessionRequest.Create(method, _baseUri, resource, query, session);
             request.Content = new FormUrlEncodedContent([
                 new KeyValuePair<string, string>("data", JsonSerializer.Serialize(body, JsonOptions)),
             ]);
 
-            using var response = _httpClient.Send(request);
+            using var response = _httpClient.Send(request, HttpCompletionOption.ResponseContentRead, requestToken);
             ThrowIfAuthenticationRejected(response, resource, session);
             response.EnsureSuccessStatusCode();
-            var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            var text = response.Content.ReadAsStringAsync(requestToken).GetAwaiter().GetResult();
             var document = ParseOptionalJson(text);
             if (document is not null)
             {
@@ -2141,6 +2577,10 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             }
 
             return document;
+        }
+        finally
+        {
+            _authenticatedRequestGate.Release();
         }
     }
 
@@ -3482,7 +3922,14 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         long bytesPerSecond = 0,
         string? message = null)
     {
-        TransferProgress?.Invoke(this, new O2TransferProgress(phase, fileName, bytesTransferred, totalBytes, bytesPerSecond, message));
+        try
+        {
+            TransferProgress?.Invoke(this, new O2TransferProgress(phase, fileName, bytesTransferred, totalBytes, bytesPerSecond, message));
+        }
+        catch
+        {
+            // A UI progress subscriber must never change the outcome of a remote filesystem operation.
+        }
     }
 
     private static string UploadFailureMessage(Exception exception)

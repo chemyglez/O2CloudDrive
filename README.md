@@ -12,7 +12,7 @@ Aplicacion Windows en C#/.NET 8 que monta O2 Cloud como una unidad virtual con W
 - Guardar la sesion en Windows Credential Manager.
 - Mostrar carpetas y archivos reales de O2 Cloud.
 - Permitir abrir archivos reales mediante descargas con `Range`.
-- Crear carpetas, subir archivos nuevos, renombrar/mover y enviar elementos a la papelera en O2 Cloud.
+- Crear carpetas, subir archivos nuevos, sustituir archivos existentes, renombrar/mover y enviar elementos a la papelera en O2 Cloud.
 - Leer la cuota real con `get-storage-space` para que Windows no muestre el volumen fijo de 10 GB.
 - Mantener el backend simulado para pruebas locales sin tocar la cuenta.
 - Mantener una arquitectura modular: `O2CloudApiClient`, `AuthService`, `VirtualFileSystem`, `LocalCacheService`, `UploadDownloadService`, `ConfigService`.
@@ -41,6 +41,10 @@ Tambien se publican variantes para actualizar equipos que ya tienen las dependen
 
 Corrige el caso en el que O2 ya mostraba los archivos, pero la ventana permanecia en `Sesion detectada, esperando a que O2 termine de validarla`. La consulta de la carpeta raiz usa el metodo `GET` que espera O2 y las peticiones normales no envian un `X-deviceid` fijo. La aplicacion obtiene la `validationkey` actual de la respuesta o de la cookie, admite tambien el alias `validation_key` y propaga cada renovacion a la sesion usada por el montaje. Las claves antiguas y las respuestas que terminan fuera de orden ya no desplazan a la clave actual.
 
+## Correccion de sobrescritura en 0.8.6 beta
+
+Al guardar cambios sobre un archivo existente, la aplicacion sustituye el objeto remoto mediante una operacion confirmada por identificador, nombre y tamano. La nueva version se sube con un nombre temporal unico, el objeto anterior se aparta de forma reversible y solo entonces se asigna el nombre definitivo al nuevo objeto. Se consulta el tamano remoto anterior antes de sustituirlo, aunque la copia local ya tenga otro tamano. Si falla antes de confirmar el cambio, se intenta restaurar el objeto anterior; cualquier fallo de restauracion se notifica y la copia local se conserva junto a sus datos de recuperacion. Las escrituras y los renombrados del mismo archivo esperan a que termine la subida en curso, y `Flush` no informa de exito hasta recibir la confirmacion remota.
+
 ## Correccion de sesion en 0.8.5 beta
 
 La ventana de login solo guarda la sesion cuando O2 acepta la misma consulta de carpeta raiz que utiliza el montaje. La captura espera a que WebView2 consolide la clave y las cookies, incluye las cookies aplicables a `/sapi/` y rechaza respuestas incompletas. Si O2 invalida la sesion entre la validacion y el montaje, la aplicacion elimina la credencial rechazada y permite un unico login nuevo.
@@ -57,7 +61,11 @@ Buscar actualizaciones
 
 ## Rendimiento y cache
 
-La unidad usa descargas por rango y cache local por bloques para acelerar relecturas de archivos grandes. En video y audio se activa una precarga de bloques posteriores para reducir esperas durante la reproduccion.
+La unidad usa descargas por rango y cache local por bloques, tambien para las lecturas pequenas habituales de Windows. La primera lectura puede descargar hasta un bloque de 4 MiB; las siguientes reutilizan ese bloque y solo leen del disco local el fragmento solicitado. La cache distingue las versiones remotas. La precarga adicional de video y audio es opcional y esta desactivada por defecto.
+
+Tras una subida confirmada se conservan hasta 16 copias locales limpias de un maximo de 16 MiB cada una, para acelerar la siguiente lectura o edicion. Las copias pendientes de subir o confirmar se conservan aparte y no se expulsan por ese limite. La edicion parcial de archivos grandes descarga el original a disco en bloques de 8 MiB; una descarga incompleta falla antes de modificar el contenido remoto. El truncado a cero o la escritura del archivo completo evita descargar la version anterior.
+
+Las consultas de cuota se reutilizan durante 30 segundos. Las peticiones de metadatos tienen un limite de 15 segundos y cada fase de confirmacion remota, de 20 segundos; los rangos de descarga tienen un limite de 60 segundos que incluye el cuerpo. Las respuestas con rango o longitud incorrectos se rechazan. Estos limites pueden hacer fallar una operacion si O2 o la conexion no responden a tiempo; una escritura fallida conserva su copia local.
 
 Opciones principales en `appsettings.json`:
 

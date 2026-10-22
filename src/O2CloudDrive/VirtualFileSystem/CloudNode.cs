@@ -1,3 +1,5 @@
+using O2CloudDrive.Api;
+
 namespace O2CloudDrive.VirtualFileSystem;
 
 public sealed class CloudNode
@@ -40,8 +42,10 @@ public sealed class CloudNode
     public ulong HighestWrittenOffset { get; internal set; }
     public bool UploadPendingRemoteConfirmation { get; internal set; }
     public bool UploadInProgress { get; internal set; }
+    internal ManualResetEventSlim UploadCompleted { get; } = new(initialState: true);
     public bool IsDirty { get; internal set; }
     public bool IsNew { get; internal set; }
+    internal O2CloudItemDto? RemoteSnapshot { get; set; }
     public bool IsVirtualTrashRoot { get; internal set; }
     public bool IsTrashItem { get; internal set; }
     public bool ChildrenLoaded { get; internal set; }

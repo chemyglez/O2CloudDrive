@@ -271,6 +271,7 @@ public sealed class O2VirtualFileSystem : FileSystemBase
         fileInfo = default;
         if (fileNode is CloudNode node)
         {
+            _store.Commit(node);
             fileInfo = ToFileInfo(node);
         }
 

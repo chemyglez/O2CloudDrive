@@ -2,13 +2,16 @@ using O2CloudDrive.Api;
 using O2CloudDrive.Auth;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 
 namespace O2CloudDrive.VirtualFileSystem;
 
 public sealed class O2CloudFileStore : ICloudFileStore
 {
     private const ulong MaxEditableFileBytes = 3_900_000_000UL;
-    private const uint DirectReadThresholdBytes = 256 * 1024;
+    private const int HydrationChunkBytes = 8 * 1024 * 1024;
+    private const ulong MaxRetainedConfirmedFileBytes = 16UL * 1024 * 1024;
+    private const int MaxRetainedConfirmedFiles = 16;
     private const int MinReadCacheBlockSizeBytes = 256 * 1024;
     private const int MaxReadCacheBlockSizeBytes = 16 * 1024 * 1024;
     private const int MaxReadAheadBlocks = 8;
@@ -16,6 +19,9 @@ public sealed class O2CloudFileStore : ICloudFileStore
     private const string TrashNodeName = "Papelera";
     private static readonly TimeSpan RemoteChangesCheckInterval = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan ReadCachePruneInterval = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan VolumeRefreshInterval = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan VolumeRefreshFailureInterval = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan UploadCompletionTimeout = TimeSpan.FromHours(6);
     private static readonly bool EnableRemoteChangesPolling = false;
     private static readonly string[] StreamableExtensions =
     [
@@ -46,6 +52,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
     private readonly object _gate = new();
     private readonly object _readCacheGate = new();
     private readonly IO2CloudApiClient _apiClient;
+    private readonly TimeProvider _volumeTimeProvider;
     private readonly string _localContentDirectory;
     private readonly string _readCacheDirectory;
     private readonly int _readCacheBlockSizeBytes;
@@ -53,8 +60,11 @@ public sealed class O2CloudFileStore : ICloudFileStore
     private readonly long _readCacheMaxBytes;
     private readonly Dictionary<string, SemaphoreSlim> _readBlockLocks = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _readAheadInFlight = new(StringComparer.OrdinalIgnoreCase);
+    private readonly LinkedList<CloudNode> _confirmedLocalCopies = new();
     private ulong _nextIndex = 1;
     private CloudVolumeInfo _lastVolume = DefaultVolume;
+    private DateTimeOffset _nextVolumeRefreshAt;
+    private bool _volumeRefreshInProgress;
     private long _remoteChangesCursor = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
     private DateTimeOffset _nextRemoteChangesCheckAt = DateTimeOffset.UtcNow.Add(RemoteChangesCheckInterval);
     private DateTimeOffset _nextReadCachePruneAt = DateTimeOffset.UtcNow.Add(ReadCachePruneInterval);
@@ -66,8 +76,15 @@ public sealed class O2CloudFileStore : ICloudFileStore
     }
 
     public O2CloudFileStore(IO2CloudApiClient apiClient, ReadCacheOptions readCacheOptions)
+        : this(apiClient, readCacheOptions, TimeProvider.System)
     {
+    }
+
+    public O2CloudFileStore(IO2CloudApiClient apiClient, ReadCacheOptions readCacheOptions, TimeProvider volumeTimeProvider)
+    {
+        ArgumentNullException.ThrowIfNull(volumeTimeProvider);
         _apiClient = apiClient;
+        _volumeTimeProvider = volumeTimeProvider;
         _readCacheDirectory = Path.Combine(readCacheOptions.CacheDirectory, "ReadBlocks");
         _readCacheBlockSizeBytes = Math.Clamp(readCacheOptions.BlockSizeBytes, MinReadCacheBlockSizeBytes, MaxReadCacheBlockSizeBytes);
         _readAheadBlocks = Math.Clamp(readCacheOptions.ReadAheadBlocks, 0, MaxReadAheadBlocks);
@@ -85,6 +102,16 @@ public sealed class O2CloudFileStore : ICloudFileStore
 
     public CloudVolumeInfo GetVolumeInfo()
     {
+        lock (_gate)
+        {
+            if (_volumeRefreshInProgress || _volumeTimeProvider.GetUtcNow() < _nextVolumeRefreshAt)
+            {
+                return _lastVolume;
+            }
+
+            _volumeRefreshInProgress = true;
+        }
+
         try
         {
             var storage = _apiClient.GetStorageInfo();
@@ -94,6 +121,7 @@ public sealed class O2CloudFileStore : ICloudFileStore
             lock (_gate)
             {
                 _lastVolume = volume;
+                _nextVolumeRefreshAt = _volumeTimeProvider.GetUtcNow().Add(VolumeRefreshInterval);
             }
 
             return volume;
@@ -102,7 +130,15 @@ public sealed class O2CloudFileStore : ICloudFileStore
         {
             lock (_gate)
             {
+                _nextVolumeRefreshAt = _volumeTimeProvider.GetUtcNow().Add(VolumeRefreshFailureInterval);
                 return _lastVolume;
+            }
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                _volumeRefreshInProgress = false;
             }
         }
     }
@@ -197,135 +233,174 @@ public sealed class O2CloudFileStore : ICloudFileStore
 
     public void Delete(CloudNode node)
     {
-        lock (_gate)
+        while (true)
         {
-            if (node.Parent is null)
+            WaitForUploadCompletion(node);
+            lock (_gate)
             {
-                throw new InvalidOperationException("The root directory cannot be deleted.");
-            }
-
-            if (node.UploadInProgress)
-            {
-                throw new IOException("No se puede eliminar un archivo mientras se esta subiendo a O2 Cloud.");
-            }
-
-            if (node.IsVirtualTrashRoot)
-            {
-                throw new UnauthorizedAccessException("La papelera virtual no se puede eliminar.");
-            }
-
-            if (node.IsDirectory && !node.IsTrashItem)
-            {
-                EnsureChildrenLoaded(node);
-                if (node.Children.Count > 0)
+                if (node.UploadInProgress)
                 {
-                    throw new IOException("The directory is not empty.");
+                    continue;
                 }
-            }
 
-            if (!node.IsNew || node.UploadPendingRemoteConfirmation)
-            {
-                if (node.IsTrashItem)
-                {
-                    _apiClient.PermanentlyDelete(ToDto(node));
-                }
-                else
-                {
-                    _apiClient.MoveToTrash(ToDto(node));
-                }
-                MarkRemoteChangeHandled();
+                DeleteLocked(node);
+                return;
             }
-
-            node.Parent.Children.Remove(node.Name);
-            DeleteLocalContent(node);
-            Touch(node.Parent, updateWriteTime: true);
         }
+    }
+
+    private void DeleteLocked(CloudNode node)
+    {
+        if (node.Parent is null)
+        {
+            throw new InvalidOperationException("The root directory cannot be deleted.");
+        }
+
+        if (node.UploadInProgress)
+        {
+            throw new IOException("No se puede eliminar un archivo mientras se esta subiendo a O2 Cloud.");
+        }
+
+        if (node.IsVirtualTrashRoot)
+        {
+            throw new UnauthorizedAccessException("La papelera virtual no se puede eliminar.");
+        }
+
+        if (node.IsDirectory && !node.IsTrashItem)
+        {
+            EnsureChildrenLoaded(node);
+            if (node.Children.Count > 0)
+            {
+                throw new IOException("The directory is not empty.");
+            }
+        }
+
+        if (!node.IsNew || node.UploadPendingRemoteConfirmation)
+        {
+            if (node.IsTrashItem)
+            {
+                _apiClient.PermanentlyDelete(ToDto(node));
+            }
+            else
+            {
+                _apiClient.MoveToTrash(ToDto(node));
+            }
+            MarkRemoteChangeHandled();
+        }
+
+        node.Parent.Children.Remove(node.Name);
+        DeleteLocalContent(node);
+        Touch(node.Parent, updateWriteTime: true);
     }
 
     public void Rename(CloudNode node, string newPath, bool replaceIfExists)
     {
-        lock (_gate)
+        if (!node.IsDirectory)
         {
-            if (node.Parent is null)
-            {
-                throw new InvalidOperationException("The root directory cannot be renamed.");
-            }
+            Commit(node);
+        }
 
-            if (node.UploadInProgress)
+        while (true)
+        {
+            WaitForUploadCompletion(node);
+            CloudNode? uploadToWaitFor = null;
+            lock (_gate)
             {
-                throw new IOException("No se puede renombrar o mover un archivo mientras se esta subiendo a O2 Cloud.");
-            }
-
-            var normalized = PathTools.Normalize(newPath);
-            var newParent = GetRequiredParent(normalized);
-            EnsureChildrenLoaded(newParent);
-            if (node.IsVirtualTrashRoot || newParent.IsVirtualTrashRoot || newParent.IsTrashItem)
-            {
-                throw new UnauthorizedAccessException("La papelera no admite renombrar o mover elementos.");
-            }
-
-            if (node.IsDirectory && IsSameOrDescendant(newParent, node))
-            {
-                throw new InvalidOperationException("A directory cannot be moved into itself.");
-            }
-
-            var oldParent = node.Parent;
-            var newName = PathTools.GetName(normalized);
-            if (ReferenceEquals(oldParent, newParent) &&
-                node.Name.Equals(newName, StringComparison.OrdinalIgnoreCase))
-            {
-                return;
-            }
-
-            if (newParent.Children.TryGetValue(newName, out var existing) && !ReferenceEquals(existing, node))
-            {
-                if (!replaceIfExists)
+                if (node.UploadInProgress)
                 {
-                    throw new IOException("The target already exists.");
+                    continue;
                 }
 
-                Delete(existing);
-            }
-
-            if (node.IsTrashItem)
-            {
-                var restored = _apiClient.RestoreFromTrash(ToDto(node));
-                var restoredDto = restored with { Name = newName, ParentId = newParent.Id };
-                _apiClient.RenameOrMove(restoredDto, newName, newParent.Id);
-
-                oldParent.Children.Remove(node.Name);
-                node.Parent = newParent;
-                node.Name = newName;
-                node.IsTrashItem = false;
-                ApplyMetadata(node, restoredDto);
-                newParent.Children[newName] = node;
-                MarkRemoteChangeHandled();
-                Touch(node, updateWriteTime: false);
-                Touch(oldParent, updateWriteTime: true);
-                if (!ReferenceEquals(oldParent, newParent))
+                if (node.Parent is null)
                 {
-                    Touch(newParent, updateWriteTime: true);
+                    throw new InvalidOperationException("The root directory cannot be renamed.");
                 }
 
-                return;
+                var normalized = PathTools.Normalize(newPath);
+                var newParent = GetRequiredParent(normalized);
+                EnsureChildrenLoaded(newParent);
+                if (node.IsVirtualTrashRoot || newParent.IsVirtualTrashRoot || newParent.IsTrashItem)
+                {
+                    throw new UnauthorizedAccessException("La papelera no admite renombrar o mover elementos.");
+                }
+
+                if (node.IsDirectory && IsSameOrDescendant(newParent, node))
+                {
+                    throw new InvalidOperationException("A directory cannot be moved into itself.");
+                }
+
+                var oldParent = node.Parent;
+                var newName = PathTools.GetName(normalized);
+                if (ReferenceEquals(oldParent, newParent) &&
+                    node.Name.Equals(newName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+
+                if (newParent.Children.TryGetValue(newName, out var existing) && !ReferenceEquals(existing, node))
+                {
+                    if (!replaceIfExists)
+                    {
+                        throw new IOException("The target already exists.");
+                    }
+
+                    if (existing.UploadInProgress)
+                    {
+                        uploadToWaitFor = existing;
+                    }
+                    else
+                    {
+                        DeleteLocked(existing);
+                    }
+                }
+
+                if (uploadToWaitFor is null)
+                {
+                    if (node.IsTrashItem)
+                    {
+                        var restored = _apiClient.RestoreFromTrash(ToDto(node));
+                        var restoredDto = restored with { Name = newName, ParentId = newParent.Id };
+                        _apiClient.RenameOrMove(restoredDto, newName, newParent.Id);
+
+                        oldParent.Children.Remove(node.Name);
+                        node.Parent = newParent;
+                        node.Name = newName;
+                        node.IsTrashItem = false;
+                        ApplyMetadata(node, restoredDto);
+                        newParent.Children[newName] = node;
+                        MarkRemoteChangeHandled();
+                        Touch(node, updateWriteTime: false);
+                        Touch(oldParent, updateWriteTime: true);
+                        if (!ReferenceEquals(oldParent, newParent))
+                        {
+                            Touch(newParent, updateWriteTime: true);
+                        }
+
+                        return;
+                    }
+
+                    if (!node.IsNew)
+                    {
+                        _apiClient.RenameOrMove(ToDto(node), newName, newParent.Id);
+                        MarkRemoteChangeHandled();
+                    }
+
+                    oldParent.Children.Remove(node.Name);
+                    node.Parent = newParent;
+                    node.Name = newName;
+                    newParent.Children[newName] = node;
+                    Touch(node, updateWriteTime: false);
+                    Touch(oldParent, updateWriteTime: true);
+                    if (!ReferenceEquals(oldParent, newParent))
+                    {
+                        Touch(newParent, updateWriteTime: true);
+                    }
+
+                    return;
+                }
             }
 
-            if (!node.IsNew)
-            {
-                _apiClient.RenameOrMove(ToDto(node), newName, newParent.Id);
-                MarkRemoteChangeHandled();
-            }
-
-            oldParent.Children.Remove(node.Name);
-            node.Parent = newParent;
-            node.Name = newName;
-            newParent.Children[newName] = node;
-            Touch(node, updateWriteTime: false);
-            Touch(oldParent, updateWriteTime: true);
-            if (!ReferenceEquals(oldParent, newParent))
-            {
-                Touch(newParent, updateWriteTime: true);
-            }
+            WaitForUploadCompletion(uploadToWaitFor);
         }
     }
 
@@ -397,79 +472,140 @@ public sealed class O2CloudFileStore : ICloudFileStore
 
     public uint WriteBytes(CloudNode file, ulong offset, byte[] buffer, bool writeToEndOfFile, bool constrainedIo)
     {
-        lock (_gate)
+        while (true)
         {
-            EnsureFile(file);
-            HydrateFile(file);
-            var currentLength = LocalContentLength(file);
-            var writeOffset = writeToEndOfFile ? currentLength : offset;
-            if (constrainedIo && writeOffset >= currentLength)
+            WaitForUploadCompletion(file);
+            lock (_gate)
             {
-                return 0;
-            }
-
-            var writable = constrainedIo
-                ? (uint)Math.Min((ulong)buffer.Length, currentLength - writeOffset)
-                : (uint)buffer.Length;
-
-            var requiredLength = checked(writeOffset + writable);
-            EnsureEditableLength(requiredLength);
-            var path = EnsureLocalContentPath(file);
-            using (var stream = new FileStream(path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read))
-            {
-                if (requiredLength > (ulong)stream.Length)
+                if (file.UploadInProgress)
                 {
-                    stream.SetLength(checked((long)requiredLength));
+                    continue;
                 }
 
-                stream.Position = checked((long)writeOffset);
-                stream.Write(buffer, 0, checked((int)writable));
+                EnsureFile(file);
+                if (buffer.Length == 0)
+                {
+                    return 0;
+                }
+
+                if (constrainedIo && (writeToEndOfFile || offset >= file.Size))
+                {
+                    return 0;
+                }
+
+                // A write covering the complete file does not need to download the old version.
+                if (!writeToEndOfFile && !constrainedIo && offset == 0 && (ulong)buffer.LongLength >= file.Size)
+                {
+                    EnsureEditableLength((ulong)buffer.LongLength);
+                    File.WriteAllBytes(EnsureLocalContentPath(file), buffer);
+                    file.Content = [];
+                    file.DeclaredSize = (ulong)buffer.LongLength;
+                    file.HighestWrittenOffset = (ulong)buffer.LongLength;
+                    file.IsDirty = true;
+                    Touch(file, updateWriteTime: true);
+                    return (uint)buffer.Length;
+                }
+
+                HydrateFile(file);
+                var currentLength = LocalContentLength(file);
+                var writeOffset = writeToEndOfFile ? currentLength : offset;
+                if (constrainedIo && writeOffset >= currentLength)
+                {
+                    return 0;
+                }
+
+                var writable = constrainedIo
+                    ? (uint)Math.Min((ulong)buffer.Length, currentLength - writeOffset)
+                    : (uint)buffer.Length;
+
+                var requiredLength = checked(writeOffset + writable);
+                EnsureEditableLength(requiredLength);
+                var path = EnsureLocalContentPath(file);
+                using (var stream = new FileStream(path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read))
+                {
+                    if (requiredLength > (ulong)stream.Length)
+                    {
+                        stream.SetLength(checked((long)requiredLength));
+                    }
+
+                    stream.Position = checked((long)writeOffset);
+                    stream.Write(buffer, 0, checked((int)writable));
+                }
+
+                file.Content = [];
+                file.DeclaredSize = Math.Max(currentLength, requiredLength);
+                file.HighestWrittenOffset = Math.Max(file.HighestWrittenOffset, writeOffset + writable);
+                file.IsDirty = true;
+                Touch(file, updateWriteTime: true);
+
+                return writable;
             }
-
-            file.Content = [];
-            file.DeclaredSize = LocalContentLength(file);
-            file.HighestWrittenOffset = Math.Max(file.HighestWrittenOffset, writeOffset + writable);
-            file.IsDirty = true;
-            Touch(file, updateWriteTime: true);
-
-            return writable;
         }
     }
 
     public void ReplaceContent(CloudNode file, byte[] content)
     {
-        lock (_gate)
+        while (true)
         {
-            EnsureFile(file);
-            EnsureEditableLength((ulong)content.LongLength);
-            File.WriteAllBytes(EnsureLocalContentPath(file), content);
-            file.Content = [];
-            file.DeclaredSize = (ulong)content.LongLength;
-            file.ExplicitFileSize = (ulong)content.LongLength;
-            file.HighestWrittenOffset = (ulong)content.LongLength;
-            file.IsDirty = true;
-            Touch(file, updateWriteTime: true);
+            WaitForUploadCompletion(file);
+            lock (_gate)
+            {
+                if (file.UploadInProgress)
+                {
+                    continue;
+                }
+
+                EnsureFile(file);
+                EnsureEditableLength((ulong)content.LongLength);
+                File.WriteAllBytes(EnsureLocalContentPath(file), content);
+                file.Content = [];
+                file.DeclaredSize = (ulong)content.LongLength;
+                file.ExplicitFileSize = (ulong)content.LongLength;
+                file.HighestWrittenOffset = (ulong)content.LongLength;
+                file.IsDirty = true;
+                Touch(file, updateWriteTime: true);
+                return;
+            }
         }
     }
 
     public void SetFileSize(CloudNode file, ulong size)
     {
-        lock (_gate)
+        while (true)
         {
-            EnsureFile(file);
-            EnsureEditableLength(size);
-            HydrateFile(file);
-            using (var stream = new FileStream(EnsureLocalContentPath(file), FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read))
+            WaitForUploadCompletion(file);
+            lock (_gate)
             {
-                stream.SetLength(checked((long)size));
-            }
+                if (file.UploadInProgress)
+                {
+                    continue;
+                }
 
-            file.Content = [];
-            file.DeclaredSize = size;
-            file.ExplicitFileSize = size;
-            file.HighestWrittenOffset = Math.Min(file.HighestWrittenOffset, size);
-            file.IsDirty = true;
-            Touch(file, updateWriteTime: true);
+                EnsureFile(file);
+                EnsureEditableLength(size);
+                if (file.Size == size)
+                {
+                    return;
+                }
+
+                if (size != 0)
+                {
+                    HydrateFile(file);
+                }
+
+                using (var stream = new FileStream(EnsureLocalContentPath(file), FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read))
+                {
+                    stream.SetLength(checked((long)size));
+                }
+
+                file.Content = [];
+                file.DeclaredSize = size;
+                file.ExplicitFileSize = size;
+                file.HighestWrittenOffset = Math.Min(file.HighestWrittenOffset, size);
+                file.IsDirty = true;
+                Touch(file, updateWriteTime: true);
+                return;
+            }
         }
     }
 
@@ -483,43 +619,68 @@ public sealed class O2CloudFileStore : ICloudFileStore
         byte[]? contentBytes;
         bool wasNew;
 
-        lock (_gate)
+        while (true)
         {
-            if (node.IsDirectory)
+            WaitForUploadCompletion(node);
+            lock (_gate)
             {
+                if (node.UploadInProgress)
+                {
+                    continue;
+                }
+
+                if (node.IsDirectory)
+                {
+                    node.IsDirty = false;
+                    node.IsNew = false;
+                    return;
+                }
+
+                if (!node.IsDirty && !node.IsNew)
+                {
+                    return;
+                }
+
+                if (node.Parent is null)
+                {
+                    throw new InvalidOperationException("The root directory cannot be uploaded.");
+                }
+
+                wasNew = node.IsNew;
+                previous = wasNew ? null : RemoteDto(node);
+                parentId = node.Parent.Id;
+                name = node.Name;
+                size = checked((long)node.Size);
+                contentPath = HasLocalContent(node) ? node.LocalContentPath : null;
+                contentBytes = contentPath is null ? node.Content.ToArray() : null;
+                if (contentPath is null)
+                {
+                    contentPath = EnsureLocalContentPath(node);
+                    File.WriteAllBytes(contentPath, contentBytes ?? []);
+                    contentBytes = null;
+                }
+
+                using (var localContent = new FileStream(contentPath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+                {
+                    localContent.Flush(flushToDisk: true);
+                }
+
+                PersistPendingWriteRecovery(
+                    contentPath,
+                    previous,
+                    parentId,
+                    name,
+                    size,
+                    wasNew);
+                node.UploadCompleted.Reset();
+                node.UploadInProgress = true;
+                node.UploadPendingRemoteConfirmation = true;
                 node.IsDirty = false;
-                node.IsNew = false;
-                return;
+                break;
             }
-
-            if (!node.IsDirty && !node.IsNew)
-            {
-                return;
-            }
-
-            if (node.UploadInProgress)
-            {
-                return;
-            }
-
-            if (node.Parent is null)
-            {
-                throw new InvalidOperationException("The root directory cannot be uploaded.");
-            }
-
-            wasNew = node.IsNew;
-            previous = wasNew ? null : ToDto(node);
-            parentId = node.Parent.Id;
-            name = node.Name;
-            size = checked((long)node.Size);
-            contentPath = HasLocalContent(node) ? node.LocalContentPath : null;
-            contentBytes = contentPath is null ? node.Content.ToArray() : null;
-            node.UploadInProgress = true;
-            node.UploadPendingRemoteConfirmation = true;
-            node.IsDirty = false;
         }
 
-        _ = Task.Run(() => UploadCommittedFile(node, previous, parentId, name, size, contentPath, contentBytes, wasNew));
+        UploadCommittedFile(node, previous, parentId, name, size, contentPath, contentBytes, wasNew);
     }
 
     private void UploadCommittedFile(
@@ -534,20 +695,19 @@ public sealed class O2CloudFileStore : ICloudFileStore
     {
         try
         {
-            using var content = OpenCommittedContentForRead(contentPath, contentBytes);
-            var uploaded = _apiClient.UploadFile(parentId, name, content, size);
-            if (previous is not null &&
-                !previous.Id.Equals(uploaded.Id, StringComparison.OrdinalIgnoreCase))
+            O2CloudItemDto uploaded;
+            using (var content = OpenCommittedContentForRead(contentPath, contentBytes))
             {
-                try
-                {
-                    _apiClient.MoveToTrash(previous);
-                }
-                catch
-                {
-                    // If cleanup of the previous remote object fails, keep the uploaded file visible.
-                }
+                uploaded = previous is null
+                    ? _apiClient.UploadFile(parentId, name, content, size)
+                    : _apiClient.ReplaceFile(previous, parentId, name, content, size);
             }
+
+            if (previous is not null)
+            {
+                InvalidateReadCache(previous);
+            }
+            InvalidateReadCache(uploaded);
 
             lock (_gate)
             {
@@ -557,17 +717,23 @@ public sealed class O2CloudFileStore : ICloudFileStore
                 node.UploadInProgress = false;
                 if (!node.UploadPendingRemoteConfirmation)
                 {
-                    DeleteLocalContent(node);
+                    // Keep the confirmed bytes for subsequent reads/edits; only the recovery marker is obsolete.
+                    RemovePendingWriteRecovery(node.LocalContentPath);
                 }
 
                 node.ExplicitFileSize = null;
                 node.HighestWrittenOffset = 0;
                 node.IsDirty = false;
                 node.IsNew = false;
+                if (!node.UploadPendingRemoteConfirmation)
+                {
+                    RetainConfirmedLocalContent(node);
+                }
+
                 MarkRemoteChangeHandled();
             }
         }
-        catch
+        catch (Exception ex)
         {
             lock (_gate)
             {
@@ -576,6 +742,14 @@ public sealed class O2CloudFileStore : ICloudFileStore
                 node.IsDirty = true;
                 node.IsNew = wasNew;
             }
+
+            throw new IOException(
+                $"La escritura no quedo confirmada en O2 Cloud. La copia local se conserva para recuperarla o reintentarla: {contentPath}",
+                ex);
+        }
+        finally
+        {
+            node.UploadCompleted.Set();
         }
     }
 
@@ -900,6 +1074,13 @@ public sealed class O2CloudFileStore : ICloudFileStore
 
     private static void ApplyMetadata(CloudNode node, O2CloudItemDto item)
     {
+        if (!node.IsDirty && !node.IsNew && !node.UploadInProgress)
+        {
+            // Metadata refreshed from O2 invalidates any previously hydrated clean local copy.
+            DeleteLocalContent(node);
+        }
+
+        node.RemoteSnapshot = item;
         node.Id = item.Id;
         node.DeclaredSize = item.IsFolder ? 0UL : (ulong)Math.Max(0, item.Size);
         node.DirectUrl = string.IsNullOrWhiteSpace(item.DirectUrl) ? null : item.DirectUrl;
@@ -938,6 +1119,13 @@ public sealed class O2CloudFileStore : ICloudFileStore
             node.DownloadToken);
     }
 
+    private static O2CloudItemDto RemoteDto(CloudNode node)
+    {
+        return node.RemoteSnapshot is { } remote
+            ? remote with { Name = node.Name, ParentId = node.Parent?.Id }
+            : ToDto(node);
+    }
+
     private byte[] ReadRemoteBytesWithCache(O2CloudItemDto item, ulong offset, uint length, ulong fileSize)
     {
         if (length == 0 || fileSize == 0)
@@ -945,15 +1133,11 @@ public sealed class O2CloudFileStore : ICloudFileStore
             return [];
         }
 
-        if (length <= DirectReadThresholdBytes)
-        {
-            return _apiClient.DownloadFile(item, offset, length);
-        }
-
         var result = new byte[length];
         var copied = 0;
         var firstBlock = offset / (ulong)_readCacheBlockSizeBytes;
         var lastBlock = (offset + length - 1) / (ulong)_readCacheBlockSizeBytes;
+        var cacheKey = ReadCacheKey(item);
 
         for (var blockIndex = firstBlock; blockIndex <= lastBlock; blockIndex++)
         {
@@ -964,8 +1148,16 @@ public sealed class O2CloudFileStore : ICloudFileStore
             }
 
             var blockLength = (uint)Math.Min((ulong)_readCacheBlockSizeBytes, fileSize - blockOffset);
-            var block = GetOrDownloadReadBlock(item, blockIndex, blockOffset, blockLength);
             var sourceOffset = checked((int)Math.Min(offset > blockOffset ? offset - blockOffset : 0, (ulong)int.MaxValue));
+            var requestedLength = Math.Min(checked((int)blockLength) - sourceOffset, result.Length - copied);
+            var path = ReadCacheBlockPath(cacheKey, blockIndex);
+            if (TryReadCachedBlockSlice(path, blockLength, sourceOffset, result, copied, requestedLength))
+            {
+                copied += requestedLength;
+                continue;
+            }
+
+            var block = GetOrDownloadReadBlock(item, blockIndex, blockOffset, blockLength);
             if (sourceOffset >= block.Length)
             {
                 continue;
@@ -1056,6 +1248,44 @@ public sealed class O2CloudFileStore : ICloudFileStore
         catch
         {
             content = [];
+            return false;
+        }
+    }
+
+    private static bool TryReadCachedBlockSlice(
+        string path,
+        uint expectedLength,
+        int sourceOffset,
+        byte[] destination,
+        int destinationOffset,
+        int length)
+    {
+        try
+        {
+            using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete))
+            {
+                if (stream.Length != expectedLength)
+                {
+                    return false;
+                }
+
+                stream.Position = sourceOffset;
+                stream.ReadExactly(destination.AsSpan(destinationOffset, length));
+            }
+
+            try
+            {
+                File.SetLastAccessTimeUtc(path, DateTime.UtcNow);
+            }
+            catch
+            {
+                // Cache access tracking must not turn a successful read into a cache miss.
+            }
+
+            return true;
+        }
+        catch
+        {
             return false;
         }
     }
@@ -1204,6 +1434,25 @@ public sealed class O2CloudFileStore : ICloudFileStore
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)));
     }
 
+    private void InvalidateReadCache(O2CloudItemDto item)
+    {
+        var directory = Path.Combine(_readCacheDirectory, ReadCacheKey(item));
+        try
+        {
+            lock (_readCacheGate)
+            {
+                if (Directory.Exists(directory))
+                {
+                    Directory.Delete(directory, recursive: true);
+                }
+            }
+        }
+        catch
+        {
+            // A stale block cache is keyed by the previous remote identity and cannot be reused.
+        }
+    }
+
     private static bool IsStreamable(O2CloudItemDto item)
     {
         if (!string.IsNullOrWhiteSpace(item.MediaKind) &&
@@ -1234,10 +1483,84 @@ public sealed class O2CloudFileStore : ICloudFileStore
             return;
         }
 
-        var content = _apiClient.DownloadFile(ToDto(file), 0, checked((uint)file.Size));
-        File.WriteAllBytes(EnsureLocalContentPath(file), content);
+        var expectedSize = file.Size;
+        var remote = ToDto(file);
+        if (expectedSize <= HydrationChunkBytes)
+        {
+            var content = _apiClient.DownloadFile(remote, 0, checked((uint)expectedSize));
+            EnsureCompleteHydrationBlock(content, expectedSize);
+            File.WriteAllBytes(EnsureLocalContentPath(file), content);
+            file.Content = [];
+            return;
+        }
+
+        var contentPath = string.IsNullOrWhiteSpace(file.LocalContentPath)
+            ? Path.Combine(_localContentDirectory, SafeCacheFileName(file.Id))
+            : file.LocalContentPath;
+        var temporaryPath = contentPath + "." + Guid.NewGuid().ToString("N") + ".hydrate.tmp";
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(contentPath)!);
+            using (var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 64 * 1024, FileOptions.SequentialScan))
+            {
+                for (ulong offset = 0; offset < expectedSize;)
+                {
+                    var length = (uint)Math.Min((ulong)HydrationChunkBytes, expectedSize - offset);
+                    var block = _apiClient.DownloadFile(remote, offset, length);
+                    EnsureCompleteHydrationBlock(block, length);
+                    stream.Write(block);
+                    offset += length;
+                }
+            }
+
+            File.Move(temporaryPath, contentPath, overwrite: true);
+            file.LocalContentPath = contentPath;
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(temporaryPath))
+                {
+                    File.Delete(temporaryPath);
+                }
+            }
+            catch
+            {
+                // An abandoned read-cache temporary file must not hide the download failure.
+            }
+        }
+
         file.Content = [];
-        file.DeclaredSize = (ulong)content.LongLength;
+    }
+
+    private static void EnsureCompleteHydrationBlock(byte[] content, ulong expectedSize)
+    {
+        if ((ulong)content.LongLength != expectedSize)
+        {
+            throw new IOException("O2 Cloud devolvio una descarga incompleta. Se conserva el archivo remoto sin modificar.");
+        }
+    }
+
+    private void RetainConfirmedLocalContent(CloudNode node)
+    {
+        _confirmedLocalCopies.Remove(node);
+        if (node.Size > MaxRetainedConfirmedFileBytes)
+        {
+            DeleteLocalContent(node);
+            return;
+        }
+
+        _confirmedLocalCopies.AddLast(node);
+        while (_confirmedLocalCopies.Count > MaxRetainedConfirmedFiles)
+        {
+            var oldest = _confirmedLocalCopies.First!.Value;
+            _confirmedLocalCopies.RemoveFirst();
+            if (!oldest.IsDirty && !oldest.IsNew && !oldest.UploadInProgress && !oldest.UploadPendingRemoteConfirmation)
+            {
+                DeleteLocalContent(oldest);
+            }
+        }
     }
 
     private static byte[] ReadLocalBytes(CloudNode file, ulong offset, uint length)
@@ -1325,10 +1648,32 @@ public sealed class O2CloudFileStore : ICloudFileStore
     {
         if (!string.IsNullOrWhiteSpace(contentPath))
         {
-            return new FileStream(contentPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            return new FileStream(contentPath, FileMode.Open, FileAccess.Read, FileShare.Read);
         }
 
         return new MemoryStream(contentBytes ?? [], writable: false);
+    }
+
+    private void WaitForUploadCompletion(CloudNode node)
+    {
+        while (true)
+        {
+            ManualResetEventSlim completion;
+            lock (_gate)
+            {
+                if (!node.UploadInProgress)
+                {
+                    return;
+                }
+
+                completion = node.UploadCompleted;
+            }
+
+            if (!completion.Wait(UploadCompletionTimeout))
+            {
+                throw new IOException("La subida a O2 Cloud no termino dentro del tiempo maximo de espera.");
+            }
+        }
     }
 
     private string EnsureLocalContentPath(CloudNode file)
@@ -1349,12 +1694,15 @@ public sealed class O2CloudFileStore : ICloudFileStore
             return;
         }
 
+        var contentPath = node.LocalContentPath;
         try
         {
-            if (File.Exists(node.LocalContentPath))
+            if (File.Exists(contentPath))
             {
-                File.Delete(node.LocalContentPath);
+                File.Delete(contentPath);
             }
+
+            RemovePendingWriteRecovery(contentPath);
         }
         catch
         {
@@ -1365,6 +1713,58 @@ public sealed class O2CloudFileStore : ICloudFileStore
             node.LocalContentPath = null;
         }
     }
+
+    private static void PersistPendingWriteRecovery(
+        string contentPath,
+        O2CloudItemDto? previous,
+        string parentId,
+        string name,
+        long size,
+        bool wasNew)
+    {
+        var recoveryPath = PendingWriteRecoveryPath(contentPath);
+        var temporaryPath = recoveryPath + ".tmp";
+        var metadata = new
+        {
+            Version = 1,
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+            ContentPath = contentPath,
+            ParentId = parentId,
+            Name = name,
+            Size = size,
+            WasNew = wasNew,
+            PreviousId = previous?.Id,
+            PreviousSize = previous?.Size,
+        };
+
+        File.WriteAllText(temporaryPath, JsonSerializer.Serialize(metadata));
+        File.Move(temporaryPath, recoveryPath, overwrite: true);
+    }
+
+    private static void RemovePendingWriteRecovery(string? contentPath)
+    {
+        if (string.IsNullOrWhiteSpace(contentPath))
+        {
+            return;
+        }
+
+        foreach (var path in new[] { PendingWriteRecoveryPath(contentPath), PendingWriteRecoveryPath(contentPath) + ".tmp" })
+        {
+            try
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+            catch
+            {
+                // A stale recovery marker only preserves the cache longer; it cannot corrupt the remote file.
+            }
+        }
+    }
+
+    private static string PendingWriteRecoveryPath(string contentPath) => contentPath + ".pending.json";
 
     private static string SafeCacheFileName(string id)
     {
@@ -1383,11 +1783,19 @@ public sealed class O2CloudFileStore : ICloudFileStore
         {
             try
             {
-                Directory.Delete(directory, recursive: true);
+                if (Directory.EnumerateFiles(directory, "*.pending.json", SearchOption.AllDirectories).Any())
+                {
+                    continue;
+                }
+
+                if (Directory.GetLastWriteTimeUtc(directory) < DateTime.UtcNow.AddDays(-7))
+                {
+                    Directory.Delete(directory, recursive: true);
+                }
             }
             catch
             {
-                // A previous process may still be shutting down. Stale cache is ignored, never reused.
+                // A previous process may still be shutting down. An uncertain cache is preserved.
             }
         }
     }

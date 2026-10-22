@@ -45,6 +45,7 @@ public sealed class O2CloudFileStoreAuthTests
         public O2CloudItemDto CreateFolder(string parentFolderId, string name) => throw new NotSupportedException();
         public O2CloudItemDto UploadFile(string parentFolderId, string name, byte[] content) => throw new NotSupportedException();
         public O2CloudItemDto UploadFile(string parentFolderId, string name, Stream content, long contentLength) => throw new NotSupportedException();
+        public O2CloudItemDto ReplaceFile(O2CloudItemDto previous, string parentFolderId, string name, Stream content, long contentLength) => throw new NotSupportedException();
         public void RenameOrMove(O2CloudItemDto item, string newName, string parentFolderId) => throw new NotSupportedException();
         public void MoveToTrash(O2CloudItemDto item) => throw new NotSupportedException();
         public O2CloudItemDto RestoreFromTrash(O2CloudItemDto item) => throw new NotSupportedException();

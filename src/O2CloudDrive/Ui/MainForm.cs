@@ -956,6 +956,7 @@ public sealed class MainForm : Form
         {
             "completed" => SuccessColor,
             "accepted" => WarningColor,
+            "warning" => WarningColor,
             "failed" => DangerColor,
             _ => MutedTextColor,
         };
@@ -979,6 +980,7 @@ public sealed class MainForm : Form
             "waiting" => $"Subida: {fileName} enviada; O2 Cloud sigue procesando el archivo ({progress.BytesTransferred}s esperando confirmacion).",
             "completed" => CompleteTransferLog(key, $"Subida concluida: {fileName} 100% enviado y confirmado por O2 Cloud."),
             "accepted" => CompleteTransferLog(key, $"Subida concluida: {fileName} 100% enviado; O2 Cloud lo acepto y queda pendiente de listado remoto."),
+            "warning" => CompleteTransferLog(key, $"Subida confirmada: {fileName}. {progress.Message}"),
             "failed" => CompleteTransferLog(key, FailureTransferLog(fileName, progress.Message)),
             _ => string.Empty,
         };
@@ -986,12 +988,12 @@ public sealed class MainForm : Form
 
     private static bool IsTransferLogPhase(string phase)
     {
-        return phase is "start" or "progress" or "confirming" or "waiting" or "completed" or "accepted" or "failed";
+        return phase is "start" or "progress" or "confirming" or "waiting" or "completed" or "accepted" or "warning" or "failed";
     }
 
     private static bool IsTerminalTransferPhase(string phase)
     {
-        return phase is "completed" or "accepted" or "failed";
+        return phase is "completed" or "accepted" or "warning" or "failed";
     }
 
     private void ShowTransferNotification(O2TransferProgress progress)
