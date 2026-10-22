@@ -204,7 +204,7 @@ internal sealed class InstallerForm : Form
 
             MessageBox.Show(
                 NeedsReboot
-                    ? "O2 Cloud Drive 0.8.7 beta se ha instalado correctamente. WinFsp ha pedido reiniciar Windows antes de montar unidades."
+                    ? "O2 Cloud Drive 0.8.6 beta se ha instalado correctamente. WinFsp ha pedido reiniciar Windows antes de montar unidades."
                     : Program.CompletedMessage,
                 "O2 Cloud Drive",
                 MessageBoxButtons.OK,
