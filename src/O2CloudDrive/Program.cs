@@ -173,7 +173,7 @@ internal static class Program
                 httpClient,
                 baseUri,
                 session,
-                HttpMethod.Post,
+                HttpMethod.Get,
                 "media/folder/root",
                 new Dictionary<string, string?> { ["action"] = "get" });
         }
