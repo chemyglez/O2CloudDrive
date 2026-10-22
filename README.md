@@ -27,21 +27,21 @@ Aplicacion Windows en C#/.NET 8 que monta O2 Cloud como una unidad virtual con W
 Para usuario final se recomienda usar el instalador:
 
 ```text
-dist\O2CloudDrive-0.8.6-beta-Setup.exe
+dist\O2CloudDrive-0.8.7-beta-Setup.exe
 ```
 
 Ese instalador no necesita que el equipo tenga .NET 8 instalado. Incluye la app autocontenida, WinFsp y Microsoft Edge WebView2 Runtime x64. Al ejecutarlo pedira permisos de administrador porque WinFsp instala un driver de sistema. Si WinFsp o WebView2 ya existen en el equipo, el instalador los omite.
 
 Tambien se publican variantes para actualizar equipos que ya tienen las dependencias:
 
-- `O2CloudDrive-0.8.6-beta-Update.exe`: actualizacion sin WinFsp ni WebView2 embebidos. La app sigue siendo autocontenida, por lo que no requiere instalar .NET.
-- `O2CloudDrive-0.8.6-beta-Update-Net8.exe`: actualizacion sin WinFsp, WebView2 ni runtime .NET embebido. Requiere Microsoft .NET 8 Desktop Runtime instalado.
+- `O2CloudDrive-0.8.7-beta-Update.exe`: actualizacion sin WinFsp ni WebView2 embebidos. La app sigue siendo autocontenida, por lo que no requiere instalar .NET.
+- `O2CloudDrive-0.8.7-beta-Update-Net8.exe`: actualizacion sin WinFsp, WebView2 ni runtime .NET embebido. Requiere Microsoft .NET 8 Desktop Runtime instalado.
 
 ## Correccion de login y rotacion de sesion en 0.8.6 beta
 
 Corrige el caso en el que O2 ya mostraba los archivos, pero la ventana permanecia en `Sesion detectada, esperando a que O2 termine de validarla`. La consulta de la carpeta raiz usa el metodo `GET` que espera O2 y las peticiones normales no envian un `X-deviceid` fijo. La aplicacion obtiene la `validationkey` actual de la respuesta o de la cookie, admite tambien el alias `validation_key` y propaga cada renovacion a la sesion usada por el montaje. Las claves antiguas y las respuestas que terminan fuera de orden ya no desplazan a la clave actual.
 
-## Correccion de sobrescritura en 0.8.6 beta
+## Correccion de sobrescritura y rendimiento en 0.8.7 beta
 
 Al guardar cambios sobre un archivo existente, la aplicacion sustituye el objeto remoto mediante una operacion confirmada por identificador, nombre y tamano. La nueva version se sube con un nombre temporal unico, el objeto anterior se aparta de forma reversible y solo entonces se asigna el nombre definitivo al nuevo objeto. Se consulta el tamano remoto anterior antes de sustituirlo, aunque la copia local ya tenga otro tamano. Si falla antes de confirmar el cambio, se intenta restaurar el objeto anterior; cualquier fallo de restauracion se notifica y la copia local se conserva junto a sus datos de recuperacion. Las escrituras y los renombrados del mismo archivo esperan a que termine la subida en curso, y `Flush` no informa de exito hasta recibir la confirmacion remota.
 
@@ -107,8 +107,8 @@ El instalador completo se genera con:
 Salida esperada:
 
 ```text
-dist\O2CloudDrive-0.8.6-beta-Setup.exe
-dist\O2CloudDrive-0.8.6-beta-Setup.sha256.txt
+dist\O2CloudDrive-0.8.7-beta-Setup.exe
+dist\O2CloudDrive-0.8.7-beta-Setup.sha256.txt
 ```
 
 El script descarga los prerrequisitos oficiales si no estan ya en `installer\prereqs`, publica la app como autocontenida, empaqueta el payload y publica un setup unico para Windows x64.
