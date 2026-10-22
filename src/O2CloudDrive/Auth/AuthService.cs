@@ -8,6 +8,7 @@ public interface IAuthService
     O2Session? EnsureAuthenticated(bool allowInteractive, bool forceInteractive = false);
     void InvalidateSession();
     bool InvalidateSessionIfCurrent(O2Session expectedSession);
+    bool RefreshValidationKeyIfCurrent(O2Session expectedSession, string validationKey);
     void Logout();
 }
 
@@ -17,8 +18,10 @@ public sealed class AuthService : IAuthService
     private readonly ISessionStore _sessionStore;
     private readonly IInteractiveLoginService _loginService;
     private readonly O2SessionValidator _validator;
+    private readonly object _authenticationGate = new();
     private readonly object _sessionGate = new();
     private O2Session? _currentSession;
+    private bool _currentSessionIsPersistent;
     private long _sessionGeneration;
 
     public AuthService(
@@ -66,6 +69,14 @@ public sealed class AuthService : IAuthService
 
     public O2Session? EnsureAuthenticated(bool allowInteractive, bool forceInteractive = false)
     {
+        lock (_authenticationGate)
+        {
+            return EnsureAuthenticatedCore(allowInteractive, forceInteractive);
+        }
+    }
+
+    private O2Session? EnsureAuthenticatedCore(bool allowInteractive, bool forceInteractive)
+    {
         long generation;
         lock (_sessionGate)
         {
@@ -82,11 +93,13 @@ public sealed class AuthService : IAuthService
             var environmentSession = TryEnvironmentSession();
             if (environmentSession is not null)
             {
-                switch (_validator.Validate(environmentSession))
+                var validation = _validator.ValidateSession(environmentSession);
+                switch (validation.Status)
                 {
                     case O2SessionValidationStatus.Valid:
-                        return TryPromoteSession(environmentSession, generation, persist: false)
-                            ? environmentSession
+                        var validatedSession = validation.ValidatedSession ?? environmentSession;
+                        return TryPromoteSession(validatedSession, generation, persist: false)
+                            ? validatedSession
                             : CurrentAuthenticatedSession();
                     case O2SessionValidationStatus.Unavailable:
                         if (!IsCurrentGeneration(generation))
@@ -108,11 +121,13 @@ public sealed class AuthService : IAuthService
             var storedSession = _sessionStore.TryRead();
             if (storedSession is not null)
             {
-                switch (_validator.Validate(storedSession))
+                var validation = _validator.ValidateSession(storedSession);
+                switch (validation.Status)
                 {
                     case O2SessionValidationStatus.Valid:
-                        return TryPromoteSession(storedSession, generation, persist: false)
-                            ? storedSession
+                        var validatedSession = validation.ValidatedSession ?? storedSession;
+                        return TryPromoteSession(validatedSession, generation, persist: true)
+                            ? validatedSession
                             : CurrentAuthenticatedSession();
                     case O2SessionValidationStatus.Unavailable:
                         if (!IsCurrentGeneration(generation))
@@ -187,10 +202,41 @@ public sealed class AuthService : IAuthService
         }
     }
 
+    public bool RefreshValidationKeyIfCurrent(O2Session expectedSession, string validationKey)
+    {
+        var normalized = O2ValidationKey.Normalize(validationKey);
+        if (normalized is null)
+        {
+            return false;
+        }
+
+        lock (_sessionGate)
+        {
+            if (!ReferenceEquals(_currentSession, expectedSession))
+            {
+                return false;
+            }
+
+            if (expectedSession.ValidationKey.Equals(normalized, StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            _currentSession = expectedSession with { ValidationKey = normalized };
+            if (_currentSessionIsPersistent)
+            {
+                _sessionStore.Save(_currentSession);
+            }
+
+            return true;
+        }
+    }
+
     private void InvalidateSessionLocked()
     {
         _sessionGeneration++;
         _currentSession = null;
+        _currentSessionIsPersistent = false;
         _sessionStore.Delete();
         ClearEnvironmentSession();
     }
@@ -243,6 +289,7 @@ public sealed class AuthService : IAuthService
             }
 
             _currentSession = session;
+            _currentSessionIsPersistent = persist;
             if (persist)
             {
                 _sessionStore.Save(session);

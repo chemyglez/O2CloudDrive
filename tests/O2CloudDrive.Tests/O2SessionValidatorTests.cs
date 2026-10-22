@@ -58,6 +58,39 @@ public sealed class O2SessionValidatorTests
         Assert.Equal(string.Empty, request.Header("X-deviceid"));
     }
 
+    [Fact]
+    public void ValidateSession_PropagatesRotatedKeyFromSuccessfulRootResponse()
+    {
+        using var handler = new RecordingHandler(_ => JsonResponse(
+            HttpStatusCode.OK,
+            "{\"data\":{\"folder\":{\"folderid\":\"root-test\"},\"validation_key\":\"rotated-key-456\"}}"));
+        using var httpClient = new HttpClient(handler);
+        var validator = new O2SessionValidator(httpClient, "https://cloud.o2online.es/sapi/");
+
+        var result = validator.ValidateSession(TestSession);
+
+        Assert.Equal(O2SessionValidationStatus.Valid, result.Status);
+        Assert.NotNull(result.ValidatedSession);
+        Assert.Equal("rotated-key-456", result.ValidatedSession.ValidationKey);
+        Assert.Same(TestSession.Cookies, result.ValidatedSession.Cookies);
+        Assert.Equal(TestSession.UserAgent, result.ValidatedSession.UserAgent);
+    }
+
+    [Fact]
+    public void ValidateSession_DoesNotPropagateKeyFromAuthenticationError()
+    {
+        using var handler = new RecordingHandler(_ => JsonResponse(
+            HttpStatusCode.OK,
+            "{\"error\":\"unauthorized\",\"validationKey\":\"untrusted-key-456\"}"));
+        using var httpClient = new HttpClient(handler);
+        var validator = new O2SessionValidator(httpClient, "https://cloud.o2online.es/sapi/");
+
+        var result = validator.ValidateSession(TestSession);
+
+        Assert.Equal(O2SessionValidationStatus.Rejected, result.Status);
+        Assert.Null(result.ValidatedSession);
+    }
+
     [Theory]
     [InlineData("")]
     [InlineData("{}")]
@@ -76,6 +109,7 @@ public sealed class O2SessionValidatorTests
     [InlineData("{\"error\":\"unauthorized\"}")]
     [InlineData("{\"errorcode\":\"401\"}")]
     [InlineData("{\"error\":{\"code\":401,\"message\":\"rejected\"}}")]
+    [InlineData("{\"data\":{\"error\":{\"code\":401,\"message\":\"unauthorized\"},\"folder\":[{\"folderid\":\"must-not-pass\"}]}}")]
     public void Validate_RejectsExplicitAuthenticationErrorInSuccessfulResponse(string responseBody)
     {
         using var handler = new RecordingHandler(_ => JsonResponse(HttpStatusCode.OK, responseBody));
@@ -83,6 +117,19 @@ public sealed class O2SessionValidatorTests
         var validator = new O2SessionValidator(httpClient, "https://cloud.o2online.es/sapi/");
 
         Assert.Equal(O2SessionValidationStatus.Rejected, validator.Validate(TestSession));
+    }
+
+    [Theory]
+    [InlineData("{\"success\":false,\"folders\":[{\"folderid\":\"must-not-pass\"}]}")]
+    [InlineData("{\"error\":{\"code\":500,\"message\":\"failed\"},\"children\":[{\"folderid\":\"must-not-pass\"}]}")]
+    [InlineData("{\"data\":{\"error\":{\"code\":500,\"message\":\"failed\"},\"items\":[{\"folderid\":\"must-not-pass\"}]}}")]
+    public void Validate_DoesNotAcceptRootShapeWhenPayloadReportsError(string responseBody)
+    {
+        using var handler = new RecordingHandler(_ => JsonResponse(HttpStatusCode.OK, responseBody));
+        using var httpClient = new HttpClient(handler);
+        var validator = new O2SessionValidator(httpClient, "https://cloud.o2online.es/sapi/");
+
+        Assert.Equal(O2SessionValidationStatus.Unavailable, validator.Validate(TestSession));
     }
 
     [Fact]

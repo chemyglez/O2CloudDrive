@@ -68,6 +68,39 @@ public sealed class AuthServiceTests
     }
 
     [Fact]
+    public void EnsureAuthenticated_PersistsRotatedKeyFromStoredSessionValidation()
+    {
+        var store = new MemorySessionStore { StoredSession = CandidateSession };
+        using var httpClient = new HttpClient(new RotatingValidHandler());
+        var validator = new O2SessionValidator(httpClient, "https://cloud.o2online.es/sapi/");
+        var auth = new AuthService(store, new FixedLoginService(null), validator);
+
+        var session = auth.EnsureAuthenticated(allowInteractive: false);
+
+        Assert.NotNull(session);
+        Assert.Equal("rotated-key-456", session.ValidationKey);
+        Assert.Equal("rotated-key-456", store.StoredSession?.ValidationKey);
+        Assert.Equal(1, store.SaveCount);
+    }
+
+    [Fact]
+    public void RefreshValidationKey_DoesNotLetOlderResponseOverwriteNewSession()
+    {
+        var store = new MemorySessionStore();
+        using var httpClient = new HttpClient(new UnavailableHandler());
+        var auth = new AuthService(
+            store,
+            new FixedLoginService(CandidateSession),
+            new O2SessionValidator(httpClient, "https://cloud.o2online.es/sapi/"));
+        var original = auth.EnsureAuthenticated(allowInteractive: true, forceInteractive: true)!;
+
+        Assert.True(auth.RefreshValidationKeyIfCurrent(original, "fresh-key-456"));
+        Assert.False(auth.RefreshValidationKeyIfCurrent(original, "late-stale-key-789"));
+        Assert.Equal("fresh-key-456", auth.GetCurrentSession().ValidationKey);
+        Assert.Equal("fresh-key-456", store.StoredSession?.ValidationKey);
+    }
+
+    [Fact]
     public async Task EnsureAuthenticated_DoesNotRestoreSessionInvalidatedDuringValidation()
     {
         var store = new MemorySessionStore { StoredSession = CandidateSession };
@@ -85,6 +118,27 @@ public sealed class AuthServiceTests
         Assert.Null(await validation);
         Assert.False(auth.HasValidatedSession);
         Assert.Null(store.StoredSession);
+    }
+
+    [Fact]
+    public async Task EnsureAuthenticated_SerializesConcurrentStoredSessionValidation()
+    {
+        var store = new MemorySessionStore { StoredSession = CandidateSession };
+        using var handler = new ConcurrentValidationHandler();
+        using var httpClient = new HttpClient(handler);
+        var validator = new O2SessionValidator(httpClient, "https://cloud.o2online.es/sapi/");
+        var auth = new AuthService(store, new FixedLoginService(null), validator);
+
+        var first = Task.Run(() => auth.EnsureAuthenticated(allowInteractive: false));
+        Assert.True(handler.FirstRequestStarted.Wait(TimeSpan.FromSeconds(2)));
+        var second = Task.Run(() => auth.EnsureAuthenticated(allowInteractive: false));
+
+        var sessions = await Task.WhenAll(first, second);
+
+        Assert.Equal(1, handler.SendCount);
+        Assert.Equal(0, store.DeleteCount);
+        Assert.All(sessions, session => Assert.Equal("rotated-key-456", session?.ValidationKey));
+        Assert.Equal("rotated-key-456", store.StoredSession?.ValidationKey);
     }
 
     private sealed class MemorySessionStore : ISessionStore
@@ -182,6 +236,69 @@ public sealed class AuthServiceTests
             {
                 RequestStarted.Dispose();
                 ReleaseResponse.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
+    }
+
+    private sealed class RotatingValidHandler : HttpMessageHandler
+    {
+        protected override HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    "{\"data\":{\"folders\":[{\"folderid\":\"root-test\"}],\"validationKey\":\"rotated-key-456\"}}"),
+            };
+        }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            return Task.FromResult(Send(request, cancellationToken));
+        }
+    }
+
+    private sealed class ConcurrentValidationHandler : HttpMessageHandler
+    {
+        private readonly ManualResetEventSlim _secondRequestStarted = new(false);
+        private int _sendCount;
+
+        public ManualResetEventSlim FirstRequestStarted { get; } = new(false);
+        public int SendCount => Volatile.Read(ref _sendCount);
+
+        protected override HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var requestNumber = Interlocked.Increment(ref _sendCount);
+            if (requestNumber == 1)
+            {
+                FirstRequestStarted.Set();
+                _secondRequestStarted.Wait(TimeSpan.FromMilliseconds(250), cancellationToken);
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        "{\"data\":{\"folders\":[{\"folderid\":\"root-test\"}],\"validationKey\":\"rotated-key-456\"}}"),
+                };
+            }
+
+            _secondRequestStarted.Set();
+            return new HttpResponseMessage(HttpStatusCode.Unauthorized)
+            {
+                Content = new StringContent("{\"error\":\"unauthorized\"}"),
+            };
+        }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            return Task.FromResult(Send(request, cancellationToken));
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                FirstRequestStarted.Dispose();
+                _secondRequestStarted.Dispose();
             }
 
             base.Dispose(disposing);

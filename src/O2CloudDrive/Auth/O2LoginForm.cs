@@ -1,5 +1,4 @@
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 using O2CloudDrive.Ui;
@@ -8,17 +7,9 @@ namespace O2CloudDrive.Auth;
 
 public sealed class O2LoginForm : Form
 {
-    private static readonly Regex ValidationKeyValueRegex = new(
-        "^[A-Za-z0-9._-]{8,}$",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
-    private static readonly Regex QueryValidationKeyRegex = new(
-        "(?:^|[?&])validationkey=([^&#\\s\\\"']+)",
-        RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant);
-    private static readonly Regex JsonValidationKeyRegex = new(
-        "\"validationkey\"\\s*:\\s*\"([A-Za-z0-9._-]{8,})\"",
-        RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly TimeSpan SessionSettleDelay = TimeSpan.FromMilliseconds(1800);
     private const int MaxValidationKeyCandidates = 5;
+    private const int MaxRootResponseCharacters = 1024 * 1024;
 
     private readonly Uri _loginUri;
     private readonly Uri _apiBaseUri;
@@ -36,6 +27,7 @@ public sealed class O2LoginForm : Form
     private readonly Dictionary<string, DateTimeOffset> _validationKeyObservedAt = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource _captureCancellation = new();
     private string? _successfulRootValidationKey;
+    private long _latestRootResponseOrdinal;
     private bool _capturing;
 
     public O2LoginForm(Uri loginUri, Uri apiBaseUri, O2SessionValidator validator)
@@ -93,6 +85,11 @@ public sealed class O2LoginForm : Form
         {
             _captureTimer.Stop();
             _captureCancellation.Cancel();
+            if (_webView.CoreWebView2 is not null)
+            {
+                _webView.CoreWebView2.WebResourceResponseReceived -= OnWebResourceResponseReceived;
+            }
+
             _webView.Dispose();
         };
     }
@@ -132,33 +129,7 @@ public sealed class O2LoginForm : Form
                 return;
             }
 
-            _webView.CoreWebView2.WebResourceResponseReceived += (_, args) =>
-            {
-                if (!CanContinueCapture)
-                {
-                    return;
-                }
-
-                try
-                {
-                    var validationKey = SuccessfulRootValidationKey(
-                        args.Request.Method,
-                        args.Request.Uri,
-                        args.Response.StatusCode,
-                        _apiBaseUri);
-                    if (validationKey is null)
-                    {
-                        return;
-                    }
-
-                    _successfulRootValidationKey = validationKey;
-                    RememberValidationKey(validationKey);
-                }
-                catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException or System.Runtime.InteropServices.COMException)
-                {
-                    // The response is only a prioritization hint; the .NET validator remains authoritative.
-                }
-            };
+            _webView.CoreWebView2.WebResourceResponseReceived += OnWebResourceResponseReceived;
 
             _webView.CoreWebView2.NewWindowRequested += (_, args) =>
             {
@@ -237,6 +208,82 @@ public sealed class O2LoginForm : Form
         }
     }
 
+    private async void OnWebResourceResponseReceived(
+        object? sender,
+        CoreWebView2WebResourceResponseReceivedEventArgs args)
+    {
+        if (!CanContinueCapture)
+        {
+            return;
+        }
+
+        try
+        {
+            if (!IsSuccessfulRootResponse(
+                    args.Request.Method,
+                    args.Request.Uri,
+                    args.Response.StatusCode,
+                    _apiBaseUri))
+            {
+                return;
+            }
+
+            var responseOrdinal = Interlocked.Increment(ref _latestRootResponseOrdinal);
+            var requestKey = O2ValidationKey.ExtractFromUri(args.Request.Uri).FirstOrDefault();
+            if (requestKey is not null)
+            {
+                _successfulRootValidationKey = requestKey;
+                RememberValidationKey(requestKey);
+            }
+
+            using var content = await args.Response.GetContentAsync();
+            var responseText = await ReadLimitedTextAsync(content, _captureCancellation.Token);
+            if (!CanContinueCapture ||
+                responseText is null ||
+                !IsLatestRootResponse(responseOrdinal, Volatile.Read(ref _latestRootResponseOrdinal)))
+            {
+                return;
+            }
+
+            var responseKeys = ExtractValidationKeysFromJson(responseText);
+            foreach (var responseKey in responseKeys.Reverse())
+            {
+                RememberValidationKey(responseKey);
+            }
+
+            _successfulRootValidationKey = responseKeys.FirstOrDefault() ?? requestKey;
+        }
+        catch (OperationCanceledException) when (_captureCancellation.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException or IOException or System.Runtime.InteropServices.COMException)
+        {
+            // The response is only a prioritization hint; the .NET validator remains authoritative.
+        }
+    }
+
+    private static async Task<string?> ReadLimitedTextAsync(Stream stream, CancellationToken cancellationToken)
+    {
+        using var reader = new StreamReader(stream);
+        var buffer = new char[8192];
+        var text = new System.Text.StringBuilder();
+        while (true)
+        {
+            var read = await reader.ReadAsync(buffer.AsMemory(), cancellationToken);
+            if (read == 0)
+            {
+                return text.ToString();
+            }
+
+            if (text.Length + read > MaxRootResponseCharacters)
+            {
+                return null;
+            }
+
+            text.Append(buffer, 0, read);
+        }
+    }
+
     private async Task CaptureAndValidateAsync()
     {
         if (_capturing || !CanContinueCapture || _webView.CoreWebView2 is null)
@@ -271,7 +318,7 @@ public sealed class O2LoginForm : Form
             var result = await Task.Run(
                 () => ValidateCandidates(
                     settledSessions,
-                    session => _validator.Validate(session, _captureCancellation.Token)),
+                    session => _validator.ValidateSession(session, _captureCancellation.Token)),
                 _captureCancellation.Token);
             if (!CanContinueCapture)
             {
@@ -315,10 +362,16 @@ public sealed class O2LoginForm : Form
     {
         var state = await ReadBrowserStateAsync();
         var serializedState = state?.GetRawText() ?? string.Empty;
+        var cookies = await ReadCookiesAsync();
+        var cookieValidationKey = O2ValidationKey.ExtractFromCookies(cookies);
         var capturedKeys = ReadStringArray(state, "validationKeys")
             .Concat(ExtractValidationKeys(serializedState));
         var validationKeys = SelectValidationKeys(
-            _successfulRootValidationKey ?? ReadString(state, "validationKey"),
+            [
+                _successfulRootValidationKey,
+                cookieValidationKey,
+                ReadString(state, "validationKey"),
+            ],
             capturedKeys,
             _recentValidationKeys);
 
@@ -332,7 +385,6 @@ public sealed class O2LoginForm : Form
             RememberValidationKey(validationKey);
         }
 
-        var cookies = await ReadCookiesAsync();
         var userAgent = ReadString(state, "userAgent") ?? string.Empty;
 
         return validationKeys
@@ -443,18 +495,12 @@ public sealed class O2LoginForm : Form
     }
 
     internal static IReadOnlyList<string> SelectValidationKeys(
-        string? currentPageValue,
+        IEnumerable<string?> preferredValues,
         IEnumerable<string> capturedValues,
         IEnumerable<string> rememberedValues)
     {
         var candidates = new List<string>();
-        var current = NormalizeValidationKey(currentPageValue);
-        if (current is not null)
-        {
-            AddValidationKey(candidates, current);
-        }
-
-        foreach (var value in capturedValues)
+        foreach (var value in preferredValues)
         {
             AddValidationKey(candidates, value);
         }
@@ -464,23 +510,28 @@ public sealed class O2LoginForm : Form
             AddValidationKey(candidates, value);
         }
 
+        foreach (var value in capturedValues)
+        {
+            AddValidationKey(candidates, value);
+        }
+
         return candidates.Take(MaxValidationKeyCandidates).ToList();
     }
 
     internal static SessionValidationResult ValidateCandidates(
         IEnumerable<O2Session> sessions,
-        Func<O2Session, O2SessionValidationStatus> validate)
+        Func<O2Session, O2SessionValidationResult> validate)
     {
         var hadUnavailable = false;
         foreach (var session in sessions)
         {
-            var status = validate(session);
-            if (status == O2SessionValidationStatus.Valid)
+            var result = validate(session);
+            if (result.Status == O2SessionValidationStatus.Valid)
             {
-                return new SessionValidationResult(session, hadUnavailable);
+                return new SessionValidationResult(result.ValidatedSession ?? session, hadUnavailable);
             }
 
-            if (status == O2SessionValidationStatus.Unavailable)
+            if (result.Status == O2SessionValidationStatus.Unavailable)
             {
                 hadUnavailable = true;
             }
@@ -495,11 +546,26 @@ public sealed class O2LoginForm : Form
         int statusCode,
         Uri apiBaseUri)
     {
+        if (!IsSuccessfulRootResponse(method, requestUri, statusCode, apiBaseUri) ||
+            !Uri.TryCreate(requestUri, UriKind.Absolute, out var uri))
+        {
+            return null;
+        }
+
+        return O2ValidationKey.ExtractFromUri(uri.AbsoluteUri).FirstOrDefault();
+    }
+
+    internal static bool IsSuccessfulRootResponse(
+        string? method,
+        string? requestUri,
+        int statusCode,
+        Uri apiBaseUri)
+    {
         if (!HttpMethod.Get.Method.Equals(method, StringComparison.OrdinalIgnoreCase) ||
             statusCode is < 200 or >= 300 ||
             !Uri.TryCreate(requestUri, UriKind.Absolute, out var uri))
         {
-            return null;
+            return false;
         }
 
         var rootUri = new Uri(apiBaseUri, "media/folder/root");
@@ -507,10 +573,10 @@ public sealed class O2LoginForm : Form
             !uri.AbsolutePath.Equals(rootUri.AbsolutePath, StringComparison.OrdinalIgnoreCase) ||
             !QueryContains(uri, "action", "get"))
         {
-            return null;
+            return false;
         }
 
-        return ExtractValidationKeys(uri.AbsoluteUri).FirstOrDefault();
+        return true;
     }
 
     private static bool QueryContains(Uri uri, string name, string expectedValue)
@@ -541,35 +607,30 @@ public sealed class O2LoginForm : Form
 
     internal static IReadOnlyList<string> ExtractValidationKeys(string? text)
     {
+        return O2ValidationKey.ExtractFromText(text);
+    }
+
+    internal static IReadOnlyList<string> ExtractValidationKeysFromJson(string? text)
+    {
         if (string.IsNullOrWhiteSpace(text))
         {
             return [];
         }
 
-        var keys = new List<string>();
-        foreach (Match match in QueryValidationKeyRegex.Matches(text))
+        try
         {
-            var rawValue = match.Groups[1].Value;
-            try
-            {
-                rawValue = Uri.UnescapeDataString(rawValue);
-            }
-            catch (UriFormatException)
-            {
-            }
-
-            AddValidationKey(keys, rawValue);
+            using var document = JsonDocument.Parse(text);
+            return O2ValidationKey.ExtractFromJson(document.RootElement);
         }
-
-        foreach (var candidateText in new[] { text, text.Replace("\\\"", "\"", StringComparison.Ordinal) })
+        catch (JsonException)
         {
-            foreach (Match match in JsonValidationKeyRegex.Matches(candidateText))
-            {
-                AddValidationKey(keys, match.Groups[1].Value);
-            }
+            return [];
         }
+    }
 
-        return keys;
+    internal static bool IsLatestRootResponse(long responseOrdinal, long latestObservedOrdinal)
+    {
+        return responseOrdinal == latestObservedOrdinal;
     }
 
     private static void AddValidationKey(ICollection<string> keys, string? value)
@@ -583,16 +644,7 @@ public sealed class O2LoginForm : Form
 
     private static string? NormalizeValidationKey(string? value)
     {
-        var normalized = value?.Trim();
-        if (string.IsNullOrWhiteSpace(normalized) ||
-            normalized.Equals("undefined", StringComparison.OrdinalIgnoreCase) ||
-            normalized.Equals("null", StringComparison.OrdinalIgnoreCase) ||
-            !ValidationKeyValueRegex.IsMatch(normalized))
-        {
-            return null;
-        }
-
-        return normalized;
+        return O2ValidationKey.Normalize(value);
     }
 
     private static string? ReadString(JsonElement? element, string name)
@@ -643,22 +695,28 @@ public sealed class O2LoginForm : Form
           const validationKeys = [];
           const addValidationKey = (value) => {
             if (typeof value !== 'string') return;
-            let normalized = value.trim();
-            try { normalized = decodeURIComponent(normalized); } catch (_) {}
-            if (!/^[A-Za-z0-9._-]{8,}$/.test(normalized)) return;
+            const normalized = value.trim();
+            if (normalized.length < 8 || normalized.length > 2048 || /\s/.test(normalized)) return;
             if (/^(undefined|null)$/i.test(normalized)) return;
             if (!validationKeys.includes(normalized)) validationKeys.push(normalized);
+          };
+          const addEncodedQueryValidationKey = (value) => {
+            if (typeof value !== 'string') return;
+            let decoded = value;
+            try { decoded = decodeURIComponent(value); } catch (_) {}
+            addValidationKey(decoded);
           };
           const scanText = (value) => {
             if (typeof value !== 'string' || !value) return;
             try {
               const url = new URL(value, location.href);
               addValidationKey(url.searchParams.get('validationkey'));
+              addValidationKey(url.searchParams.get('validation_key'));
             } catch (_) {}
-            const queryMatch = value.match(/(?:^|[?&])validationkey=([^&#\s"']+)/i);
-            if (queryMatch) addValidationKey(queryMatch[1]);
+            const queryMatch = value.match(/(?:^|[?&])validation_?key=([^&#\s"']+)/i);
+            if (queryMatch) addEncodedQueryValidationKey(queryMatch[1]);
             const normalizedJson = value.replace(/\\"/g, '"');
-            const propertyMatch = normalizedJson.match(/"validationkey"\s*:\s*"([A-Za-z0-9._-]{8,})"/i);
+            const propertyMatch = normalizedJson.match(/"validation_?key"\s*:\s*"([^"\r\n]{8,2048})"/i);
             if (propertyMatch) addValidationKey(propertyMatch[1]);
           };
           const scanValue = (value, depth = 0) => {
@@ -677,7 +735,7 @@ public sealed class O2LoginForm : Form
             }
             if (typeof value === 'object') {
               for (const [key, child] of Object.entries(value)) {
-                if (key.toLowerCase() === 'validationkey') addValidationKey(child);
+                if (key.replace(/_/g, '').toLowerCase() === 'validationkey') addValidationKey(child);
               }
               for (const child of Object.values(value)) scanValue(child, depth + 1);
             }

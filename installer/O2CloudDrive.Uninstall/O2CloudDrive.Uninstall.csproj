@@ -9,10 +9,10 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <AssemblyName>O2CloudDrive.Uninstall</AssemblyName>
     <RootNamespace>O2CloudDrive.Uninstall</RootNamespace>
-    <Version>0.8.6</Version>
-    <AssemblyVersion>0.8.6.0</AssemblyVersion>
-    <FileVersion>0.8.6.0</FileVersion>
-    <InformationalVersion>0.8.6-beta</InformationalVersion>
+    <Version>0.8.7</Version>
+    <AssemblyVersion>0.8.7.0</AssemblyVersion>
+    <FileVersion>0.8.7.0</FileVersion>
+    <InformationalVersion>0.8.7-beta</InformationalVersion>
     <ApplicationIcon>..\..\src\O2CloudDrive\Assets\O2CloudDrive.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>

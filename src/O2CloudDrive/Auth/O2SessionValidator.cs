@@ -16,9 +16,16 @@ public sealed class O2SessionValidator
 
     public O2SessionValidationStatus Validate(O2Session session, CancellationToken cancellationToken = default)
     {
+        return ValidateSession(session, cancellationToken).Status;
+    }
+
+    public O2SessionValidationResult ValidateSession(
+        O2Session session,
+        CancellationToken cancellationToken = default)
+    {
         if (!session.IsAuthenticated)
         {
-            return O2SessionValidationStatus.Rejected;
+            return new O2SessionValidationResult(O2SessionValidationStatus.Rejected);
         }
 
         try
@@ -34,25 +41,33 @@ public sealed class O2SessionValidator
             using var response = _httpClient.Send(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
             if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
             {
-                return O2SessionValidationStatus.Rejected;
+                return new O2SessionValidationResult(O2SessionValidationStatus.Rejected);
             }
 
             if (!response.IsSuccessStatusCode)
             {
-                return O2SessionValidationStatus.Unavailable;
+                return new O2SessionValidationResult(O2SessionValidationStatus.Unavailable);
             }
 
             var text = response.Content.ReadAsStringAsync(timeout.Token).GetAwaiter().GetResult();
             using var document = O2CloudApiClient.ParseJson(text);
             if (O2CloudApiClient.HasAuthenticationError(document.RootElement))
             {
-                return O2SessionValidationStatus.Rejected;
+                return new O2SessionValidationResult(O2SessionValidationStatus.Rejected);
             }
 
             O2CloudApiClient.ThrowIfO2Error(document.RootElement, text);
-            return O2CloudApiClient.HasRootFolder(document.RootElement)
-                ? O2SessionValidationStatus.Valid
-                : O2SessionValidationStatus.Unavailable;
+            if (!O2CloudApiClient.HasRootFolder(document.RootElement))
+            {
+                return new O2SessionValidationResult(O2SessionValidationStatus.Unavailable);
+            }
+
+            var refreshedKey = O2ValidationKey.ExtractFromJson(document.RootElement).FirstOrDefault();
+            var validatedSession = refreshedKey is null ||
+                                   refreshedKey.Equals(session.ValidationKey, StringComparison.Ordinal)
+                ? session
+                : session with { ValidationKey = refreshedKey };
+            return new O2SessionValidationResult(O2SessionValidationStatus.Valid, validatedSession);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -60,7 +75,7 @@ public sealed class O2SessionValidator
         }
         catch (Exception ex) when (ex is HttpRequestException or IOException or OperationCanceledException or InvalidOperationException or System.Text.Json.JsonException)
         {
-            return O2SessionValidationStatus.Unavailable;
+            return new O2SessionValidationResult(O2SessionValidationStatus.Unavailable);
         }
     }
 }

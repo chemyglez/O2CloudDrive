@@ -35,6 +35,23 @@ public sealed class O2CloudApiClientAuthTests
         Assert.False(handler.LastHeaders?.ContainsKey("X-deviceid"));
     }
 
+    [Theory]
+    [InlineData("{\"folders\":[{\"folderid\":\"root-top-folders\"}]}", "root-top-folders")]
+    [InlineData("{\"data\":{\"folder\":[{\"folderid\":\"root-data-folder\"}]}}", "root-data-folder")]
+    [InlineData("{\"folder\":[{\"folderid\":\"root-top-folder\"}]}", "root-top-folder")]
+    [InlineData("{\"data\":{\"items\":[{\"id\":\"file-1\",\"type\":\"file\",\"size\":12},{\"folderid\":\"root-data-items\",\"type\":\"folder\"}]}}", "root-data-items")]
+    [InlineData("{\"items\":[{\"folderid\":\"root-top-items\",\"name\":\"\"}]}", "root-top-items")]
+    [InlineData("{\"data\":{\"children\":[{\"folderid\":\"root-data-children\",\"kind\":\"directory\"}]}}", "root-data-children")]
+    [InlineData("{\"children\":[{\"folderid\":\"root-top-children\",\"name\":\"\"}]}", "root-top-children")]
+    public void GetRootFolder_AcceptsAndroidRootResponseShapes(string responseBody, string expectedId)
+    {
+        var auth = new FixedAuthService(new O2Session { ValidationKey = "current-key-123" });
+        using var httpClient = new HttpClient(new StatusHandler(HttpStatusCode.OK, responseBody));
+        var api = new O2CloudApiClient(httpClient, auth, "https://cloud.o2online.es/sapi/");
+
+        Assert.Equal(expectedId, api.GetRootFolder().Id);
+    }
+
     [Fact]
     public void GetRootFolder_InvalidatesRejectedSessionWithoutLeakingValidationKey()
     {
@@ -76,6 +93,23 @@ public sealed class O2CloudApiClientAuthTests
     }
 
     [Fact]
+    public void GetRootFolder_DoesNotPersistOrExposeKeyFromErrorPayload()
+    {
+        const string untrustedKey = "untrusted-secret-key-456";
+        var auth = new FixedAuthService(new O2Session { ValidationKey = "current-key-123" });
+        using var httpClient = new HttpClient(new StatusHandler(
+            HttpStatusCode.OK,
+            $"{{\"success\":false,\"validationKey\":\"{untrustedKey}\"}}"));
+        var api = new O2CloudApiClient(httpClient, auth, "https://cloud.o2online.es/sapi/");
+
+        var error = Assert.Throws<InvalidOperationException>(() => api.GetRootFolder());
+
+        Assert.Equal("current-key-123", auth.GetCurrentSession().ValidationKey);
+        Assert.DoesNotContain(untrustedKey, error.Message, StringComparison.Ordinal);
+        Assert.Contains("[redacted]", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void CreateFolder_PropagatesAuthenticationRejectionWithoutTryingFallbacks()
     {
         var auth = new FixedAuthService(new O2Session { ValidationKey = "secret-key-123" });
@@ -108,6 +142,43 @@ public sealed class O2CloudApiClientAuthTests
         Assert.Same(newSession, auth.GetCurrentSession());
     }
 
+    [Fact]
+    public void GetRootFolder_UsesRotatedKeyOnNextApiRequest()
+    {
+        var auth = new FixedAuthService(new O2Session { ValidationKey = "old-key-123" });
+        using var handler = new SequenceHandler(
+            "{\"data\":{\"folders\":[{\"folderid\":\"root-test\"}]},\"validationKey\":\"fresh-key-456\"}",
+            "{\"data\":{\"folders\":[{\"folderid\":\"root-test\"}]}}");
+        using var httpClient = new HttpClient(handler);
+        var api = new O2CloudApiClient(httpClient, auth, "https://cloud.o2online.es/sapi/");
+
+        api.GetRootFolder();
+        api.GetRootFolder();
+
+        Assert.Equal(2, handler.Uris.Count);
+        Assert.Contains("validationkey=old-key-123", handler.Uris[0].Query, StringComparison.Ordinal);
+        Assert.Contains("validationkey=fresh-key-456", handler.Uris[1].Query, StringComparison.Ordinal);
+        Assert.Equal("fresh-key-456", auth.GetCurrentSession().ValidationKey);
+    }
+
+    [Fact]
+    public void UploadFile_PropagatesRotatedKeyBeforeConfirmingTheUpload()
+    {
+        var auth = new FixedAuthService(new O2Session { ValidationKey = "old-key-123" });
+        using var handler = new UploadRotationHandler();
+        using var httpClient = new HttpClient(handler);
+        var api = new O2CloudApiClient(httpClient, auth, "https://cloud.o2online.es/sapi/");
+
+        var uploaded = api.UploadFile("root-test", "sample.txt", [1, 2, 3]);
+
+        Assert.Equal("file-test", uploaded.Id);
+        Assert.Equal("fresh-key-456", auth.GetCurrentSession().ValidationKey);
+        Assert.Contains("validationkey=old-key-123", handler.Uris[0].Query, StringComparison.Ordinal);
+        Assert.All(
+            handler.Uris.Skip(1),
+            uri => Assert.Contains("validationkey=fresh-key-456", uri.Query, StringComparison.Ordinal));
+    }
+
     private sealed class FixedAuthService(O2Session session) : IAuthService
     {
         private O2Session _session = session;
@@ -131,6 +202,17 @@ public sealed class O2CloudApiClientAuthTests
             }
 
             Invalidated = true;
+            return true;
+        }
+
+        public bool RefreshValidationKeyIfCurrent(O2Session expectedSession, string validationKey)
+        {
+            if (Invalidated || !ReferenceEquals(_session, expectedSession))
+            {
+                return false;
+            }
+
+            _session = expectedSession with { ValidationKey = validationKey };
             return true;
         }
 
@@ -224,6 +306,52 @@ public sealed class O2CloudApiClientAuthTests
             }
 
             base.Dispose(disposing);
+        }
+    }
+
+    private sealed class SequenceHandler(params string[] bodies) : HttpMessageHandler
+    {
+        private int _index;
+        public List<Uri> Uris { get; } = [];
+
+        protected override HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Uris.Add(request.RequestUri!);
+            var body = bodies[Math.Min(_index, bodies.Length - 1)];
+            _index++;
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(body),
+            };
+        }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            return Task.FromResult(Send(request, cancellationToken));
+        }
+    }
+
+    private sealed class UploadRotationHandler : HttpMessageHandler
+    {
+        public List<Uri> Uris { get; } = [];
+
+        protected override HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Uris.Add(request.RequestUri!);
+            var body = request.Content is MultipartFormDataContent
+                ? "{\"data\":{\"media\":{\"id\":\"file-test\",\"name\":\"sample.txt\",\"size\":3}},\"validationKey\":\"fresh-key-456\"}"
+                : request.RequestUri?.AbsolutePath.EndsWith("/media/folder", StringComparison.OrdinalIgnoreCase) == true
+                    ? "{\"data\":{\"folders\":[]}}"
+                    : "{\"data\":{\"media\":[{\"id\":\"file-test\",\"name\":\"sample.txt\",\"folderid\":\"root-test\",\"size\":3}]}}";
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(body),
+            };
+        }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            return Task.FromResult(Send(request, cancellationToken));
         }
     }
 }

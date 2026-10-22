@@ -90,11 +90,21 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
     ];
     private static readonly string[] MediaObjectContainers = ["media", "file", "item", "metadata", "data", "properties", "content", "source"];
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    private static readonly Regex SensitiveJsonValueRegex = new(
+        "(\\\"(?:validation_?key|access_?token|refresh_?token|authorization|cookie)\\\"\\s*:\\s*\\\")[^\\\"]*(\\\")",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex SensitiveParameterRegex = new(
+        "((?:validation_?key|access_?token|refresh_?token|authorization|cookie)=)[^&\\s;,\\\"]+",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex JwtRegex = new(
+        "\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\b",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
     private static readonly bool TraceDownloads =
         string.Equals(Environment.GetEnvironmentVariable("O2CLOUD_TRACE_DOWNLOADS"), "1", StringComparison.Ordinal);
     private readonly HttpClient _httpClient;
     private readonly IAuthService _authService;
     private readonly Uri _baseUri;
+    private readonly object _authenticatedRequestGate = new();
 
     public event EventHandler<O2TransferProgress>? TransferProgress;
     private readonly object _folderIdGate = new();
@@ -1006,6 +1016,7 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             {
                 ThrowIfAuthenticationRejected(document.RootElement, "upload", session);
                 ThrowIfO2Error(document.RootElement, text);
+                RefreshValidationKey(document.RootElement, session);
             }
         }
         catch (JsonException ex)
@@ -2082,21 +2093,25 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         IReadOnlyDictionary<string, string?> query,
         object? body = null)
     {
-        var session = _authService.GetCurrentSession();
-        using var request = O2SessionRequest.Create(method, _baseUri, resource, query, session);
-        if (body is not null)
+        lock (_authenticatedRequestGate)
         {
-            request.Content = new StringContent(JsonSerializer.Serialize(body, JsonOptions), Encoding.UTF8, "application/json");
-        }
+            var session = _authService.GetCurrentSession();
+            using var request = O2SessionRequest.Create(method, _baseUri, resource, query, session);
+            if (body is not null)
+            {
+                request.Content = new StringContent(JsonSerializer.Serialize(body, JsonOptions), Encoding.UTF8, "application/json");
+            }
 
-        using var response = _httpClient.Send(request);
-        ThrowIfAuthenticationRejected(response, resource, session);
-        response.EnsureSuccessStatusCode();
-        var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-        var document = ParseJson(text);
-        ThrowIfAuthenticationRejected(document.RootElement, resource, session);
-        ThrowIfO2Error(document.RootElement, text);
-        return document;
+            using var response = _httpClient.Send(request);
+            ThrowIfAuthenticationRejected(response, resource, session);
+            response.EnsureSuccessStatusCode();
+            var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            var document = ParseJson(text);
+            ThrowIfAuthenticationRejected(document.RootElement, resource, session);
+            ThrowIfO2Error(document.RootElement, text);
+            RefreshValidationKey(document.RootElement, session);
+            return document;
+        }
     }
 
     private JsonDocument? SendFormJson(
@@ -2105,24 +2120,40 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         IReadOnlyDictionary<string, string?> query,
         object body)
     {
-        var session = _authService.GetCurrentSession();
-        using var request = O2SessionRequest.Create(method, _baseUri, resource, query, session);
-        request.Content = new FormUrlEncodedContent([
-            new KeyValuePair<string, string>("data", JsonSerializer.Serialize(body, JsonOptions)),
-        ]);
-
-        using var response = _httpClient.Send(request);
-        ThrowIfAuthenticationRejected(response, resource, session);
-        response.EnsureSuccessStatusCode();
-        var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-        var document = ParseOptionalJson(text);
-        if (document is not null)
+        lock (_authenticatedRequestGate)
         {
-            ThrowIfAuthenticationRejected(document.RootElement, resource, session);
-            ThrowIfO2Error(document.RootElement, text);
+            var session = _authService.GetCurrentSession();
+            using var request = O2SessionRequest.Create(method, _baseUri, resource, query, session);
+            request.Content = new FormUrlEncodedContent([
+                new KeyValuePair<string, string>("data", JsonSerializer.Serialize(body, JsonOptions)),
+            ]);
+
+            using var response = _httpClient.Send(request);
+            ThrowIfAuthenticationRejected(response, resource, session);
+            response.EnsureSuccessStatusCode();
+            var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            var document = ParseOptionalJson(text);
+            if (document is not null)
+            {
+                ThrowIfAuthenticationRejected(document.RootElement, resource, session);
+                ThrowIfO2Error(document.RootElement, text);
+                RefreshValidationKey(document.RootElement, session);
+            }
+
+            return document;
+        }
+    }
+
+    private void RefreshValidationKey(JsonElement root, O2Session expectedSession)
+    {
+        var refreshedKey = O2ValidationKey.ExtractFromJson(root).FirstOrDefault();
+        if (refreshedKey is null ||
+            refreshedKey.Equals(expectedSession.ValidationKey, StringComparison.Ordinal))
+        {
+            return;
         }
 
-        return document;
+        _authService.RefreshValidationKeyIfCurrent(expectedSession, refreshedKey);
     }
 
     private Uri BuildAuthenticatedUri(string resource, IReadOnlyDictionary<string, string?> query)
@@ -2695,10 +2726,84 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
     private static JsonElement RootFolderElement(JsonElement root)
     {
         var data = ObjectProperty(root, "data");
-        var folders = ArrayProperty(data, "folders");
-        return folders.Count > 0
-            ? folders[0]
-            : FirstObjectProperty(root, "rootfolder", "rootFolder", "folder") ?? root;
+        foreach (var collectionName in new[] { "folders", "folder", "items", "children" })
+        {
+            foreach (var container in new[] { data, root })
+            {
+                var candidate = FirstRootFolderIn(
+                    ArrayProperty(container, collectionName),
+                    collectionName is "folders" or "folder");
+                if (candidate is not null)
+                {
+                    return candidate.Value;
+                }
+            }
+        }
+
+        foreach (var container in new[] { data, root })
+        {
+            var candidate = FirstObjectProperty(container, "rootfolder", "rootFolder", "folder");
+            if (candidate is not null && FolderIdCandidates(candidate.Value).Count > 0)
+            {
+                return candidate.Value;
+            }
+        }
+
+        return root;
+    }
+
+    private static JsonElement? FirstRootFolderIn(
+        IReadOnlyList<JsonElement> candidates,
+        bool folderCollection)
+    {
+        foreach (var candidate in candidates)
+        {
+            if (candidate.ValueKind != JsonValueKind.Object ||
+                FolderIdCandidates(candidate).Count == 0)
+            {
+                continue;
+            }
+
+            if (folderCollection || LooksLikeRootFolderCandidate(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool LooksLikeRootFolderCandidate(JsonElement element)
+    {
+        var rawType = FirstString(element, "type", "mediatype", "mediaType", "mimetype", "kind")
+            ?.ToLowerInvariant();
+        if (!string.IsNullOrWhiteSpace(rawType))
+        {
+            if (rawType.Contains("folder", StringComparison.Ordinal) ||
+                rawType.Contains("directory", StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            if (rawType is "file" or "media" or "picture" or "video" or "audio" ||
+                rawType.Contains("image", StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+
+        return FirstString(
+                   element,
+                   "size",
+                   "filesize",
+                   "fileSize",
+                   "contentlength",
+                   "contentLength",
+                   "url",
+                   "viewurl",
+                   "downloadurl",
+                   "etag",
+                   "fingerprint") is null;
     }
 
     private static IReadOnlyList<string> MediaIdCandidates(JsonElement element)
@@ -3093,9 +3198,15 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             return;
         }
 
-        if (root.TryGetProperty("error", out var error) && IsMeaningfulError(error))
+        var data = ObjectProperty(root, "data");
+        foreach (var container in new[] { root, data })
         {
-            throw new InvalidOperationException($"O2 Cloud devolvio error: {TrimPreview(error.ToString())}");
+            if (container.ValueKind == JsonValueKind.Object &&
+                container.TryGetProperty("error", out var error) &&
+                IsMeaningfulError(error))
+            {
+                throw new InvalidOperationException($"O2 Cloud devolvio error: {TrimPreview(error.ToString())}");
+            }
         }
 
         var success = FirstString(root, "success");
@@ -3120,6 +3231,17 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             return false;
         }
 
+        if (HasAuthenticationErrorInContainer(root))
+        {
+            return true;
+        }
+
+        var data = ObjectProperty(root, "data");
+        return data.ValueKind == JsonValueKind.Object && HasAuthenticationErrorInContainer(data);
+    }
+
+    private static bool HasAuthenticationErrorInContainer(JsonElement root)
+    {
         var authenticated = FirstString(root, "authenticated", "isAuthenticated", "isauthenticated");
         if (authenticated is not null && authenticated.Equals("false", StringComparison.OrdinalIgnoreCase))
         {
@@ -3286,7 +3408,10 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
 
     private static string TrimPreview(string value)
     {
-        var compact = value.ReplaceLineEndings(" ").Trim();
+        var redacted = SensitiveJsonValueRegex.Replace(value, "$1[redacted]$2");
+        redacted = SensitiveParameterRegex.Replace(redacted, "$1[redacted]");
+        redacted = JwtRegex.Replace(redacted, "[redacted-jwt]");
+        var compact = redacted.ReplaceLineEndings(" ").Trim();
         return compact.Length <= 240 ? compact : compact[..240] + "...";
     }
 
