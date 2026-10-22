@@ -28,7 +28,7 @@ public sealed class O2SessionValidatorTests
         Assert.Equal(O2SessionValidationStatus.Rejected, validator.Validate(TestSession));
 
         var request = Assert.Single(handler.Requests);
-        Assert.Equal(HttpMethod.Post, request.Method);
+        Assert.Equal(HttpMethod.Get, request.Method);
         Assert.EndsWith("/sapi/media/folder/root", request.Uri.AbsolutePath, StringComparison.Ordinal);
     }
 
@@ -44,7 +44,7 @@ public sealed class O2SessionValidatorTests
         Assert.Equal(O2SessionValidationStatus.Valid, validator.Validate(TestSession));
 
         var request = Assert.Single(handler.Requests);
-        Assert.Equal(HttpMethod.Post, request.Method);
+        Assert.Equal(HttpMethod.Get, request.Method);
         Assert.Contains("action=get", request.Uri.Query, StringComparison.Ordinal);
         Assert.Contains("validationkey=current-key-123", request.Uri.Query, StringComparison.Ordinal);
         Assert.Equal("session-cookie=cookie-value", request.Header("Cookie"));
@@ -55,7 +55,7 @@ public sealed class O2SessionValidatorTests
         Assert.Equal(
             "es-ES,es;q=0.9,en;q=0.8",
             request.Header("Accept-Language").Replace(" ", string.Empty, StringComparison.Ordinal));
-        Assert.Equal("O2CloudDrive", request.Header("X-deviceid"));
+        Assert.Equal(string.Empty, request.Header("X-deviceid"));
     }
 
     [Theory]

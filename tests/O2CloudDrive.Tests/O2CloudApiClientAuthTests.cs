@@ -7,6 +7,35 @@ namespace O2CloudDrive.Tests;
 public sealed class O2CloudApiClientAuthTests
 {
     [Fact]
+    public void GetRootFolder_UsesGetWithoutSyntheticDeviceId()
+    {
+        var auth = new FixedAuthService(new O2Session
+        {
+            ValidationKey = "current-key-123",
+            Cookies = new Dictionary<string, string> { ["session-cookie"] = "cookie-value" },
+            UserAgent = "O2CloudDrive.Tests/1.0",
+        });
+        var handler = new StatusHandler(
+            HttpStatusCode.OK,
+            "{\"data\":{\"folders\":[{\"folderid\":\"root-test\",\"name\":\"\"}]}}");
+        using var httpClient = new HttpClient(handler);
+        var api = new O2CloudApiClient(httpClient, auth, "https://cloud.o2online.es/sapi/");
+
+        var root = api.GetRootFolder();
+
+        Assert.Equal("root-test", root.Id);
+        Assert.Equal(HttpMethod.Get, handler.LastMethod);
+        Assert.EndsWith("/sapi/media/folder/root", handler.LastUri?.AbsolutePath, StringComparison.Ordinal);
+        Assert.Contains("action=get", handler.LastUri?.Query, StringComparison.Ordinal);
+        Assert.Contains("validationkey=current-key-123", handler.LastUri?.Query, StringComparison.Ordinal);
+        Assert.Equal("session-cookie=cookie-value", handler.LastHeader("Cookie"));
+        Assert.Equal("O2CloudDrive.Tests/1.0", handler.LastHeader("User-Agent"));
+        Assert.Equal("https://cloud.o2online.es", handler.LastHeader("Origin"));
+        Assert.Equal("https://cloud.o2online.es/", handler.LastHeader("Referer"));
+        Assert.False(handler.LastHeaders?.ContainsKey("X-deviceid"));
+    }
+
+    [Fact]
     public void GetRootFolder_InvalidatesRejectedSessionWithoutLeakingValidationKey()
     {
         const string validationKey = "secret-key-123";
@@ -136,10 +165,24 @@ public sealed class O2CloudApiClientAuthTests
     private sealed class StatusHandler(HttpStatusCode statusCode, string content) : HttpMessageHandler
     {
         public int SendCount { get; private set; }
+        public HttpMethod? LastMethod { get; private set; }
+        public Uri? LastUri { get; private set; }
+        public IReadOnlyDictionary<string, string>? LastHeaders { get; private set; }
+
+        public string LastHeader(string name)
+        {
+            return LastHeaders?.TryGetValue(name, out var value) == true ? value : string.Empty;
+        }
 
         protected override HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             SendCount++;
+            LastMethod = request.Method;
+            LastUri = request.RequestUri;
+            LastHeaders = request.Headers.ToDictionary(
+                pair => pair.Key,
+                pair => string.Join(", ", pair.Value),
+                StringComparer.OrdinalIgnoreCase);
             return new HttpResponseMessage(statusCode)
             {
                 Content = new StringContent(content),

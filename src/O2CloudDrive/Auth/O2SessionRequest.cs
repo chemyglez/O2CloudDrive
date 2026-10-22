@@ -55,7 +55,6 @@ internal static class O2SessionRequest
         request.Headers.TryAddWithoutValidation("Origin", baseUri.GetLeftPart(UriPartial.Authority));
         request.Headers.TryAddWithoutValidation("Referer", baseUri.GetLeftPart(UriPartial.Authority) + "/");
         request.Headers.TryAddWithoutValidation("Accept-Language", "es-ES,es;q=0.9,en;q=0.8");
-        request.Headers.TryAddWithoutValidation("X-deviceid", "O2CloudDrive");
     }
 
     public static bool IsSameOrigin(Uri left, Uri right)

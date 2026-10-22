@@ -35,6 +35,7 @@ public sealed class O2LoginForm : Form
     private readonly LinkedList<string> _recentValidationKeys = new();
     private readonly Dictionary<string, DateTimeOffset> _validationKeyObservedAt = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource _captureCancellation = new();
+    private string? _successfulRootValidationKey;
     private bool _capturing;
 
     public O2LoginForm(Uri loginUri, Uri apiBaseUri, O2SessionValidator validator)
@@ -130,6 +131,34 @@ public sealed class O2LoginForm : Form
             {
                 return;
             }
+
+            _webView.CoreWebView2.WebResourceResponseReceived += (_, args) =>
+            {
+                if (!CanContinueCapture)
+                {
+                    return;
+                }
+
+                try
+                {
+                    var validationKey = SuccessfulRootValidationKey(
+                        args.Request.Method,
+                        args.Request.Uri,
+                        args.Response.StatusCode,
+                        _apiBaseUri);
+                    if (validationKey is null)
+                    {
+                        return;
+                    }
+
+                    _successfulRootValidationKey = validationKey;
+                    RememberValidationKey(validationKey);
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException or System.Runtime.InteropServices.COMException)
+                {
+                    // The response is only a prioritization hint; the .NET validator remains authoritative.
+                }
+            };
 
             _webView.CoreWebView2.NewWindowRequested += (_, args) =>
             {
@@ -239,34 +268,27 @@ public sealed class O2LoginForm : Form
             }
 
             _statusLabel.Text = "Sesion detectada. Validando la carpeta raiz con O2 Cloud...";
-            foreach (var session in settledSessions)
+            var result = await Task.Run(
+                () => ValidateCandidates(
+                    settledSessions,
+                    session => _validator.Validate(session, _captureCancellation.Token)),
+                _captureCancellation.Token);
+            if (!CanContinueCapture)
             {
-                var validationStatus = await Task.Run(
-                    () => _validator.Validate(session, _captureCancellation.Token),
-                    _captureCancellation.Token);
-                if (!CanContinueCapture)
-                {
-                    return;
-                }
+                return;
+            }
 
-                if (validationStatus == O2SessionValidationStatus.Unavailable)
-                {
-                    _statusLabel.Text = "O2 Cloud no permite comprobar la sesion ahora. Se reintentara sin borrar los datos del login.";
-                    return;
-                }
-
-                if (validationStatus != O2SessionValidationStatus.Valid)
-                {
-                    continue;
-                }
-
-                CapturedSession = session;
+            if (result.Session is not null)
+            {
+                CapturedSession = result.Session;
                 DialogResult = DialogResult.OK;
                 Close();
                 return;
             }
 
-            _statusLabel.Text = "Sesion detectada, esperando a que O2 termine de validarla...";
+            _statusLabel.Text = result.HadUnavailable
+                ? "O2 Cloud no permite comprobar la sesion ahora. Se reintentara sin borrar los datos del login."
+                : "Sesion detectada, esperando a que O2 termine de validarla...";
         }
         catch (OperationCanceledException) when (_captureCancellation.IsCancellationRequested)
         {
@@ -296,7 +318,7 @@ public sealed class O2LoginForm : Form
         var capturedKeys = ReadStringArray(state, "validationKeys")
             .Concat(ExtractValidationKeys(serializedState));
         var validationKeys = SelectValidationKeys(
-            ReadString(state, "validationKey"),
+            _successfulRootValidationKey ?? ReadString(state, "validationKey"),
             capturedKeys,
             _recentValidationKeys);
 
@@ -425,30 +447,96 @@ public sealed class O2LoginForm : Form
         IEnumerable<string> capturedValues,
         IEnumerable<string> rememberedValues)
     {
+        var candidates = new List<string>();
         var current = NormalizeValidationKey(currentPageValue);
         if (current is not null)
         {
-            return [current];
+            AddValidationKey(candidates, current);
         }
 
-        var captured = new List<string>();
         foreach (var value in capturedValues)
         {
-            AddValidationKey(captured, value);
+            AddValidationKey(candidates, value);
         }
 
-        if (captured.Count > 0)
-        {
-            return [captured[0]];
-        }
-
-        var remembered = new List<string>();
         foreach (var value in rememberedValues)
         {
-            AddValidationKey(remembered, value);
+            AddValidationKey(candidates, value);
         }
 
-        return remembered.Take(1).ToList();
+        return candidates.Take(MaxValidationKeyCandidates).ToList();
+    }
+
+    internal static SessionValidationResult ValidateCandidates(
+        IEnumerable<O2Session> sessions,
+        Func<O2Session, O2SessionValidationStatus> validate)
+    {
+        var hadUnavailable = false;
+        foreach (var session in sessions)
+        {
+            var status = validate(session);
+            if (status == O2SessionValidationStatus.Valid)
+            {
+                return new SessionValidationResult(session, hadUnavailable);
+            }
+
+            if (status == O2SessionValidationStatus.Unavailable)
+            {
+                hadUnavailable = true;
+            }
+        }
+
+        return new SessionValidationResult(null, hadUnavailable);
+    }
+
+    internal static string? SuccessfulRootValidationKey(
+        string? method,
+        string? requestUri,
+        int statusCode,
+        Uri apiBaseUri)
+    {
+        if (!HttpMethod.Get.Method.Equals(method, StringComparison.OrdinalIgnoreCase) ||
+            statusCode is < 200 or >= 300 ||
+            !Uri.TryCreate(requestUri, UriKind.Absolute, out var uri))
+        {
+            return null;
+        }
+
+        var rootUri = new Uri(apiBaseUri, "media/folder/root");
+        if (!O2SessionRequest.IsSameOrigin(uri, rootUri) ||
+            !uri.AbsolutePath.Equals(rootUri.AbsolutePath, StringComparison.OrdinalIgnoreCase) ||
+            !QueryContains(uri, "action", "get"))
+        {
+            return null;
+        }
+
+        return ExtractValidationKeys(uri.AbsoluteUri).FirstOrDefault();
+    }
+
+    private static bool QueryContains(Uri uri, string name, string expectedValue)
+    {
+        foreach (var component in uri.Query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var pair = component.Split('=', 2);
+            if (pair.Length != 2)
+            {
+                continue;
+            }
+
+            try
+            {
+                if (Uri.UnescapeDataString(pair[0]).Equals(name, StringComparison.OrdinalIgnoreCase) &&
+                    Uri.UnescapeDataString(pair[1]).Equals(expectedValue, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            catch (UriFormatException)
+            {
+            }
+        }
+
+        return false;
     }
 
     internal static IReadOnlyList<string> ExtractValidationKeys(string? text)
@@ -537,6 +625,8 @@ public sealed class O2LoginForm : Form
             .Select(value => value!)
             .ToList();
     }
+
+    internal readonly record struct SessionValidationResult(O2Session? Session, bool HadUnavailable);
 
     private const string CaptureScript = """
         (() => {

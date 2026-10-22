@@ -111,7 +111,7 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
 
     public O2CloudItemDto GetRootFolder()
     {
-        using var document = SendJson(HttpMethod.Post, "media/folder/root", new Dictionary<string, string?>
+        using var document = SendJson(HttpMethod.Get, "media/folder/root", new Dictionary<string, string?>
         {
             ["action"] = "get",
         });

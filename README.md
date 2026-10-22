@@ -27,15 +27,19 @@ Aplicacion Windows en C#/.NET 8 que monta O2 Cloud como una unidad virtual con W
 Para usuario final se recomienda usar el instalador:
 
 ```text
-dist\O2CloudDrive-0.8.5-beta-Setup.exe
+dist\O2CloudDrive-0.8.6-beta-Setup.exe
 ```
 
 Ese instalador no necesita que el equipo tenga .NET 8 instalado. Incluye la app autocontenida, WinFsp y Microsoft Edge WebView2 Runtime x64. Al ejecutarlo pedira permisos de administrador porque WinFsp instala un driver de sistema. Si WinFsp o WebView2 ya existen en el equipo, el instalador los omite.
 
 Tambien se publican variantes para actualizar equipos que ya tienen las dependencias:
 
-- `O2CloudDrive-0.8.5-beta-Update.exe`: actualizacion sin WinFsp ni WebView2 embebidos. La app sigue siendo autocontenida, por lo que no requiere instalar .NET.
-- `O2CloudDrive-0.8.5-beta-Update-Net8.exe`: actualizacion sin WinFsp, WebView2 ni runtime .NET embebido. Requiere Microsoft .NET 8 Desktop Runtime instalado.
+- `O2CloudDrive-0.8.6-beta-Update.exe`: actualizacion sin WinFsp ni WebView2 embebidos. La app sigue siendo autocontenida, por lo que no requiere instalar .NET.
+- `O2CloudDrive-0.8.6-beta-Update-Net8.exe`: actualizacion sin WinFsp, WebView2 ni runtime .NET embebido. Requiere Microsoft .NET 8 Desktop Runtime instalado.
+
+## Correccion de login en 0.8.6 beta
+
+Corrige el caso en el que el navegador integrado ya mostraba los archivos, pero la aplicacion permanecia en `Sesion detectada, esperando a que O2 termine de validarla`. La consulta de la carpeta raiz ahora usa el metodo `GET` que espera O2, las peticiones normales ya no envian un `X-deviceid` fijo y la captura prueba hasta cinco claves recientes si la primera ha quedado obsoleta. La clave asociada a una respuesta HTTP 2xx de la carpeta raiz en WebView2 se prioriza, pero la ventana solo se cierra despues de que el cliente de montaje reproduzca y valide esa consulta.
 
 ## Correccion de sesion en 0.8.5 beta
 
@@ -95,8 +99,8 @@ El instalador completo se genera con:
 Salida esperada:
 
 ```text
-dist\O2CloudDrive-0.8.5-beta-Setup.exe
-dist\O2CloudDrive-0.8.5-beta-Setup.sha256.txt
+dist\O2CloudDrive-0.8.6-beta-Setup.exe
+dist\O2CloudDrive-0.8.6-beta-Setup.sha256.txt
 ```
 
 El script descarga los prerrequisitos oficiales si no estan ya en `installer\prereqs`, publica la app como autocontenida, empaqueta el payload y publica un setup unico para Windows x64.

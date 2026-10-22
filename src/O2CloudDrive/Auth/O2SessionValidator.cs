@@ -26,7 +26,7 @@ public sealed class O2SessionValidator
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeout.CancelAfter(RequestTimeout);
             using var request = O2SessionRequest.Create(
-                HttpMethod.Post,
+                HttpMethod.Get,
                 _baseUri,
                 "media/folder/root",
                 new Dictionary<string, string?> { ["action"] = "get" },
