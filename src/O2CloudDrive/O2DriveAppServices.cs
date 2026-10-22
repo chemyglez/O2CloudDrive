@@ -44,6 +44,7 @@ public sealed class O2DriveAppServices : IDisposable
         {
             ConnectTimeout = TimeSpan.FromSeconds(30),
             PooledConnectionLifetime = TimeSpan.FromMinutes(10),
+            UseCookies = false,
         };
         var httpClient = new HttpClient(handler)
         {
@@ -51,7 +52,7 @@ public sealed class O2DriveAppServices : IDisposable
         };
         var sessionValidator = new O2SessionValidator(httpClient, config.ApiBaseUrl);
         var sessionStore = new WindowsCredentialSessionStore(config.CredentialTarget);
-        var loginService = new WebViewInteractiveLoginService(config.LoginUrl);
+        var loginService = new WebViewInteractiveLoginService(config.LoginUrl, config.ApiBaseUrl);
         var authService = new AuthService(sessionStore, loginService, sessionValidator);
         var apiClient = new O2CloudApiClient(httpClient, authService, config.ApiBaseUrl);
         var readCacheOptions = new ReadCacheOptions(

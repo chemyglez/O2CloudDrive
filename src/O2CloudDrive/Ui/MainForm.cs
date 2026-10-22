@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using O2CloudDrive.Api;
+using O2CloudDrive.Auth;
 using O2CloudDrive.Config;
 using O2CloudDrive.Mounting;
 using O2CloudDrive.Updates;
@@ -798,6 +799,13 @@ public sealed class MainForm : Form
                     : "auth:stored-session:expired");
             }
         }
+        catch (O2SessionUnavailableException)
+        {
+            if (!IsDisposed)
+            {
+                UpdateState("auth:stored-session:unavailable");
+            }
+        }
         catch
         {
             if (!IsDisposed)
@@ -821,9 +829,7 @@ public sealed class MainForm : Form
         {
             if (!_services.Config.UseSimulatedData && _services.Config.RequireAuthentication)
             {
-                var session = _services.AuthService.EnsureAuthenticated(
-                    allowInteractive: true,
-                    forceInteractive: _forceLoginCheckBox.Checked);
+                var session = await EnsureSessionForMountAsync(_forceLoginCheckBox.Checked);
                 if (session is not { IsAuthenticated: true })
                 {
                     throw new InvalidOperationException("No hay una sesion valida de O2 Cloud.");
@@ -831,7 +837,23 @@ public sealed class MainForm : Form
             }
 
             var options = new DriveMountOptions(mountPoint, volumeLabel, _services.Config.UseSimulatedData);
-            await Task.Run(() => _services.MountService.Mount(options));
+            try
+            {
+                await Task.Run(() => _services.MountService.Mount(options));
+            }
+            catch (O2AuthenticationException) when (!_services.Config.UseSimulatedData && _services.Config.RequireAuthentication)
+            {
+                UpdateState("auth:session-rejected-retrying");
+                var renewedSession = _services.AuthService.EnsureAuthenticated(
+                    allowInteractive: true,
+                    forceInteractive: true);
+                if (renewedSession is not { IsAuthenticated: true })
+                {
+                    throw new InvalidOperationException("O2 rechazo la sesion y no se completo un login nuevo.");
+                }
+
+                await Task.Run(() => _services.MountService.Mount(options));
+            }
             _notifyIcon.ShowBalloonTip(1500, "O2 Cloud Drive", $"Unidad montada en {mountPoint}", ToolTipIcon.Info);
             if (!_services.Config.UseSimulatedData && _services.MountService.LastRootItemCount == 0)
             {
@@ -840,6 +862,23 @@ public sealed class MainForm : Form
 
             return $"mount:ok {mountPoint}";
         });
+    }
+
+    private async Task<O2Session?> EnsureSessionForMountAsync(bool forceInteractive)
+    {
+        if (forceInteractive)
+        {
+            return _services.AuthService.EnsureAuthenticated(allowInteractive: true, forceInteractive: true);
+        }
+
+        if (_services.AuthService.HasValidatedSession)
+        {
+            return _services.AuthService.EnsureAuthenticated(allowInteractive: false);
+        }
+
+        var storedSession = await Task.Run(
+            () => _services.AuthService.EnsureAuthenticated(allowInteractive: false));
+        return storedSession ?? _services.AuthService.EnsureAuthenticated(allowInteractive: true);
     }
 
     private async Task UnmountAsync()
@@ -1073,6 +1112,37 @@ public sealed class MainForm : Form
             SetControlsEnabled(false);
             var message = await action();
             UpdateState(message);
+        }
+        catch (O2SessionUnavailableException ex)
+        {
+            UpdateState("auth:session-unavailable");
+            MessageBox.Show(
+                this,
+                ex.Message,
+                "O2 Cloud Drive",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+        catch (O2AuthenticationException ex)
+        {
+            UpdateState($"auth:session-rejected {(int)ex.StatusCode}");
+            MessageBox.Show(
+                this,
+                ex.Message + Environment.NewLine + Environment.NewLine +
+                "La sesion guardada se ha eliminado. Pulsa Login nuevo y completa de nuevo el codigo SMS.",
+                "O2 Cloud Drive",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+        catch (HttpRequestException)
+        {
+            UpdateState("network:unavailable");
+            MessageBox.Show(
+                this,
+                "No se pudo conectar con O2 Cloud. Comprueba la conexion, DNS, VPN o proxy e intentalo de nuevo. La sesion guardada no se ha eliminado.",
+                "O2 Cloud Drive",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
         }
         catch (Exception ex)
         {
@@ -1327,6 +1397,26 @@ public sealed class MainForm : Form
             return $"Actualizacion: no se pudo comprobar GitHub. {message["update:error ".Length..]}";
         }
 
+        if (message.Equals("auth:session-rejected-retrying", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Sesion: O2 rechazo la sesion durante el montaje; abriendo un unico login nuevo.";
+        }
+
+        if (message.StartsWith("auth:session-rejected ", StringComparison.OrdinalIgnoreCase))
+        {
+            return $"Sesion: O2 rechazo la credencial (HTTP {message["auth:session-rejected ".Length..]}).";
+        }
+
+        if (message.Equals("auth:session-unavailable", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Sesion: no se pudo validar ahora; la credencial guardada se ha conservado.";
+        }
+
+        if (message.Equals("network:unavailable", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Red: no se pudo conectar con O2 Cloud; la sesion guardada se ha conservado.";
+        }
+
         return message switch
         {
             "Listo." => "Preparada.",
@@ -1336,7 +1426,8 @@ public sealed class MainForm : Form
             "auth:stored-session:checking" => "Sesion guardada encontrada; validando contra O2 Cloud.",
             "auth:stored-session:ok" => "Sesion guardada validada contra O2 Cloud.",
             "auth:stored-session:expired" => "Sesion guardada caducada o rechazada por O2 Cloud; haz Login nuevo.",
-            "auth:login:start" => "Login: abriendo navegador integrado; se conserva el estado web para que el SMS de O2 no se reinicie entre intentos.",
+            "auth:stored-session:unavailable" => "Sesion guardada conservada; O2 Cloud no permite validarla ahora.",
+            "auth:login:start" => "Login: abriendo un navegador integrado limpio para iniciar una sesion nueva.",
             "auth:login:ok" => "Login: sesion validada contra O2 Cloud.",
             "auth:logout:start" => "Logout: desmontando si hace y borrando la sesion local.",
             "auth:logout:ok" => "Logout: limpieza local completada; no queda sesion guardada por la app.",

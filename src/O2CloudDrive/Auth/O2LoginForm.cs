@@ -8,11 +8,20 @@ namespace O2CloudDrive.Auth;
 
 public sealed class O2LoginForm : Form
 {
-    private static readonly Regex ValidationKeyRegex = new(
-        "validationkey[^A-Za-z0-9._-]+([A-Za-z0-9._-]{8,})",
+    private static readonly Regex ValidationKeyValueRegex = new(
+        "^[A-Za-z0-9._-]{8,}$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex QueryValidationKeyRegex = new(
+        "(?:^|[?&])validationkey=([^&#\\s\\\"']+)",
         RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex JsonValidationKeyRegex = new(
+        "\"validationkey\"\\s*:\\s*\"([A-Za-z0-9._-]{8,})\"",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly TimeSpan SessionSettleDelay = TimeSpan.FromMilliseconds(1800);
+    private const int MaxValidationKeyCandidates = 5;
 
     private readonly Uri _loginUri;
+    private readonly Uri _apiBaseUri;
     private readonly O2SessionValidator _validator;
     private readonly WebView2 _webView = new() { Dock = DockStyle.Fill };
     private readonly Label _statusLabel = new()
@@ -23,13 +32,15 @@ public sealed class O2LoginForm : Form
     };
 
     private readonly System.Windows.Forms.Timer _captureTimer = new() { Interval = 2000 };
-    private readonly HashSet<string> _seenUrls = new(StringComparer.OrdinalIgnoreCase);
+    private readonly LinkedList<string> _recentValidationKeys = new();
+    private readonly Dictionary<string, DateTimeOffset> _validationKeyObservedAt = new(StringComparer.Ordinal);
+    private readonly CancellationTokenSource _captureCancellation = new();
     private bool _capturing;
-    private string? _lastValidationKey;
 
-    public O2LoginForm(Uri loginUri, O2SessionValidator validator)
+    public O2LoginForm(Uri loginUri, Uri apiBaseUri, O2SessionValidator validator)
     {
         _loginUri = loginUri;
+        _apiBaseUri = apiBaseUri;
         _validator = validator;
 
         Text = "O2 Cloud - Login";
@@ -71,12 +82,16 @@ public sealed class O2LoginForm : Form
         _captureTimer.Tick += async (_, _) =>
         {
             await AcceptCookieConsentAsync();
-            await CaptureAndValidateAsync();
+            if (CanContinueCapture)
+            {
+                await CaptureAndValidateAsync();
+            }
         };
         Shown += async (_, _) => await InitializeWebViewAsync();
         FormClosed += (_, _) =>
         {
             _captureTimer.Stop();
+            _captureCancellation.Cancel();
             _webView.Dispose();
         };
     }
@@ -95,13 +110,27 @@ public sealed class O2LoginForm : Form
                 EnableTrackingPrevention = false,
             };
             var environment = await CoreWebView2Environment.CreateAsync(null, userDataFolder, environmentOptions);
+            if (!CanContinueCapture)
+            {
+                return;
+            }
+
             await _webView.EnsureCoreWebView2Async(environment);
+            if (!CanContinueCapture)
+            {
+                return;
+            }
 
             _webView.CoreWebView2.Profile.PreferredTrackingPreventionLevel = CoreWebView2TrackingPreventionLevel.None;
             _webView.CoreWebView2.Profile.IsPasswordAutosaveEnabled = false;
             _webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
             _webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
             await _webView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(LoginBootstrapScript);
+            if (!CanContinueCapture)
+            {
+                return;
+            }
+
             _webView.CoreWebView2.NewWindowRequested += (_, args) =>
             {
                 args.Handled = true;
@@ -109,20 +138,30 @@ public sealed class O2LoginForm : Form
             };
             _webView.CoreWebView2.NavigationStarting += (_, args) =>
             {
+                if (!CanContinueCapture)
+                {
+                    return;
+                }
+
                 TrackUrl(args.Uri);
                 _statusLabel.Text = "Login oficial de O2 Cloud cargando...";
-                if (TryExtractValidationKey(args.Uri, out var validationKey))
-                {
-                    _lastValidationKey = validationKey;
-                    BeginInvoke(async () => await CaptureAndValidateAsync(validationKey));
-                }
             };
             _webView.CoreWebView2.NavigationCompleted += async (_, _) =>
             {
+                if (!CanContinueCapture)
+                {
+                    return;
+                }
+
                 _statusLabel.Text = "Esperando telefono, contrasena y codigo SMS de O2 Cloud...";
                 await AcceptCookieConsentAsync();
+                if (!CanContinueCapture)
+                {
+                    return;
+                }
+
                 await CaptureAndValidateAsync();
-                if (CapturedSession is null)
+                if (CanContinueCapture && CapturedSession is null)
                 {
                     _statusLabel.Text = "Introduce telefono, contrasena y SMS. La app capturara la sesion cuando O2 la valide.";
                 }
@@ -130,7 +169,10 @@ public sealed class O2LoginForm : Form
             _webView.CoreWebView2.DOMContentLoaded += async (_, _) =>
             {
                 await AcceptCookieConsentAsync();
-                await CaptureAndValidateAsync();
+                if (CanContinueCapture)
+                {
+                    await CaptureAndValidateAsync();
+                }
             };
 
             _captureTimer.Start();
@@ -139,6 +181,11 @@ public sealed class O2LoginForm : Form
         }
         catch (Exception ex)
         {
+            if (!CanContinueCapture)
+            {
+                return;
+            }
+
             _statusLabel.Text = "No se pudo inicializar WebView2.";
             MessageBox.Show(this, ex.Message, "O2 Cloud Login", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
@@ -146,7 +193,7 @@ public sealed class O2LoginForm : Form
 
     private async Task AcceptCookieConsentAsync()
     {
-        if (_webView.CoreWebView2 is null)
+        if (!CanContinueCapture || _webView.CoreWebView2 is null)
         {
             return;
         }
@@ -161,9 +208,9 @@ public sealed class O2LoginForm : Form
         }
     }
 
-    private async Task CaptureAndValidateAsync(string? forcedValidationKey = null)
+    private async Task CaptureAndValidateAsync()
     {
-        if (_capturing || _webView.CoreWebView2 is null)
+        if (_capturing || !CanContinueCapture || _webView.CoreWebView2 is null)
         {
             return;
         }
@@ -171,27 +218,65 @@ public sealed class O2LoginForm : Form
         _capturing = true;
         try
         {
-            var session = await CaptureSessionAsync(forcedValidationKey);
-            if (session is not { IsAuthenticated: true })
+            var sessions = await CaptureSessionsAsync();
+            if (!CanContinueCapture)
             {
                 return;
             }
 
-            _statusLabel.Text = "Sesion detectada. Validando con O2 Cloud...";
-            var valid = await Task.Run(() => _validator.Validate(session));
-            if (!valid)
+            if (sessions.Count == 0)
             {
-                _statusLabel.Text = "Sesion detectada, esperando a que O2 termine de validarla...";
                 return;
             }
 
-            CapturedSession = session;
-            DialogResult = DialogResult.OK;
-            Close();
+            var settledSessions = sessions
+                .Where(session => HasSettled(session.ValidationKey))
+                .ToList();
+            if (settledSessions.Count == 0)
+            {
+                _statusLabel.Text = "Sesion detectada, esperando a que O2 termine de guardar las cookies...";
+                return;
+            }
+
+            _statusLabel.Text = "Sesion detectada. Validando la carpeta raiz con O2 Cloud...";
+            foreach (var session in settledSessions)
+            {
+                var validationStatus = await Task.Run(
+                    () => _validator.Validate(session, _captureCancellation.Token),
+                    _captureCancellation.Token);
+                if (!CanContinueCapture)
+                {
+                    return;
+                }
+
+                if (validationStatus == O2SessionValidationStatus.Unavailable)
+                {
+                    _statusLabel.Text = "O2 Cloud no permite comprobar la sesion ahora. Se reintentara sin borrar los datos del login.";
+                    return;
+                }
+
+                if (validationStatus != O2SessionValidationStatus.Valid)
+                {
+                    continue;
+                }
+
+                CapturedSession = session;
+                DialogResult = DialogResult.OK;
+                Close();
+                return;
+            }
+
+            _statusLabel.Text = "Sesion detectada, esperando a que O2 termine de validarla...";
+        }
+        catch (OperationCanceledException) when (_captureCancellation.IsCancellationRequested)
+        {
         }
         catch
         {
-            _statusLabel.Text = "Esperando a que O2 Cloud complete el login...";
+            if (CanContinueCapture)
+            {
+                _statusLabel.Text = "Esperando a que O2 Cloud complete el login...";
+            }
         }
         finally
         {
@@ -199,30 +284,43 @@ public sealed class O2LoginForm : Form
         }
     }
 
-    private async Task<O2Session?> CaptureSessionAsync(string? forcedValidationKey)
+    private bool CanContinueCapture =>
+        !_captureCancellation.IsCancellationRequested &&
+        !IsDisposed &&
+        !Disposing;
+
+    private async Task<IReadOnlyList<O2Session>> CaptureSessionsAsync()
     {
         var state = await ReadBrowserStateAsync();
         var serializedState = state?.GetRawText() ?? string.Empty;
-        var validationKey = FirstNonEmpty(
-            forcedValidationKey,
-            _lastValidationKey,
+        var capturedKeys = ReadStringArray(state, "validationKeys")
+            .Concat(ExtractValidationKeys(serializedState));
+        var validationKeys = SelectValidationKeys(
             ReadString(state, "validationKey"),
-            ExtractValidationKey(serializedState));
+            capturedKeys,
+            _recentValidationKeys);
 
-        if (string.IsNullOrWhiteSpace(validationKey))
+        if (validationKeys.Count == 0)
         {
-            return null;
+            return [];
         }
 
-        var cookies = await ReadCookiesAsync(ReadString(state, "cookie"));
+        foreach (var validationKey in validationKeys.Reverse())
+        {
+            RememberValidationKey(validationKey);
+        }
+
+        var cookies = await ReadCookiesAsync();
         var userAgent = ReadString(state, "userAgent") ?? string.Empty;
 
-        return new O2Session
-        {
-            ValidationKey = validationKey,
-            Cookies = cookies,
-            UserAgent = userAgent,
-        };
+        return validationKeys
+            .Select(validationKey => new O2Session
+            {
+                ValidationKey = validationKey,
+                Cookies = new Dictionary<string, string>(cookies, StringComparer.OrdinalIgnoreCase),
+                UserAgent = userAgent,
+            })
+            .ToList();
     }
 
     private async Task<JsonElement?> ReadBrowserStateAsync()
@@ -237,47 +335,23 @@ public sealed class O2LoginForm : Form
         return document.RootElement.Clone();
     }
 
-    private async Task<Dictionary<string, string>> ReadCookiesAsync(string? documentCookie)
-    {
-        var cookies = ParseCookieHeader(documentCookie);
-        var webViewCookies = await _webView.CoreWebView2.CookieManager.GetCookiesAsync("https://cloud.o2online.es/");
-        foreach (var cookie in webViewCookies)
-        {
-            if (!cookie.Domain.Contains("o2online.es", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            if (!string.IsNullOrWhiteSpace(cookie.Name) && !string.IsNullOrWhiteSpace(cookie.Value))
-            {
-                cookies[cookie.Name] = cookie.Value;
-            }
-        }
-
-        return cookies;
-    }
-
-    private static Dictionary<string, string> ParseCookieHeader(string? cookieHeader)
+    private async Task<Dictionary<string, string>> ReadCookiesAsync()
     {
         var cookies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        if (string.IsNullOrWhiteSpace(cookieHeader))
+        foreach (var uri in CookieProbeUris(_loginUri, _apiBaseUri))
         {
-            return cookies;
-        }
-
-        foreach (var part in cookieHeader.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            var index = part.IndexOf('=');
-            if (index <= 0)
+            var webViewCookies = await _webView.CoreWebView2.CookieManager.GetCookiesAsync(uri.AbsoluteUri);
+            foreach (var cookie in webViewCookies)
             {
-                continue;
-            }
+                if (!CookieDomainMatches(_apiBaseUri.Host, cookie.Domain))
+                {
+                    continue;
+                }
 
-            var name = part[..index].Trim();
-            var value = part[(index + 1)..].Trim();
-            if (!string.IsNullOrWhiteSpace(name) && !string.IsNullOrWhiteSpace(value))
-            {
-                cookies[name] = value;
+                if (!string.IsNullOrWhiteSpace(cookie.Name) && !string.IsNullOrWhiteSpace(cookie.Value))
+                {
+                    cookies[cookie.Name] = cookie.Value;
+                }
             }
         }
 
@@ -286,33 +360,151 @@ public sealed class O2LoginForm : Form
 
     private void TrackUrl(string? uri)
     {
-        if (string.IsNullOrWhiteSpace(uri))
+        foreach (var validationKey in ExtractValidationKeys(uri))
+        {
+            RememberValidationKey(validationKey);
+        }
+    }
+
+    private void RememberValidationKey(string validationKey)
+    {
+        var normalized = NormalizeValidationKey(validationKey);
+        if (normalized is null)
         {
             return;
         }
 
-        _seenUrls.Add(uri);
-        if (TryExtractValidationKey(uri, out var validationKey))
+        var existing = _recentValidationKeys.Find(normalized);
+        if (existing is not null)
         {
-            _lastValidationKey = validationKey;
+            _recentValidationKeys.Remove(existing);
+        }
+        else
+        {
+            _validationKeyObservedAt[normalized] = DateTimeOffset.UtcNow;
+        }
+
+        _recentValidationKeys.AddFirst(normalized);
+        while (_recentValidationKeys.Count > MaxValidationKeyCandidates)
+        {
+            var oldest = _recentValidationKeys.Last!.Value;
+            _recentValidationKeys.RemoveLast();
+            _validationKeyObservedAt.Remove(oldest);
         }
     }
 
-    private static bool TryExtractValidationKey(string text, out string validationKey)
+    private bool HasSettled(string validationKey)
     {
-        validationKey = ExtractValidationKey(text) ?? string.Empty;
-        return !string.IsNullOrWhiteSpace(validationKey);
+        return _validationKeyObservedAt.TryGetValue(validationKey, out var observedAt) &&
+               DateTimeOffset.UtcNow - observedAt >= SessionSettleDelay;
     }
 
-    private static string? ExtractValidationKey(string? text)
+    internal static IReadOnlyList<Uri> CookieProbeUris(Uri loginUri, Uri apiBaseUri)
+    {
+        var loginRoot = new Uri(loginUri.GetLeftPart(UriPartial.Authority) + "/", UriKind.Absolute);
+        var apiRootEndpoint = new Uri(apiBaseUri, "media/folder/root");
+        return new[] { loginRoot, apiRootEndpoint }
+            .DistinctBy(uri => uri.AbsoluteUri, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    internal static bool CookieDomainMatches(string host, string? cookieDomain)
+    {
+        if (string.IsNullOrWhiteSpace(host) || string.IsNullOrWhiteSpace(cookieDomain))
+        {
+            return false;
+        }
+
+        var normalizedDomain = cookieDomain.Trim().TrimStart('.');
+        return host.Equals(normalizedDomain, StringComparison.OrdinalIgnoreCase) ||
+               host.EndsWith("." + normalizedDomain, StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static IReadOnlyList<string> SelectValidationKeys(
+        string? currentPageValue,
+        IEnumerable<string> capturedValues,
+        IEnumerable<string> rememberedValues)
+    {
+        var current = NormalizeValidationKey(currentPageValue);
+        if (current is not null)
+        {
+            return [current];
+        }
+
+        var captured = new List<string>();
+        foreach (var value in capturedValues)
+        {
+            AddValidationKey(captured, value);
+        }
+
+        if (captured.Count > 0)
+        {
+            return [captured[0]];
+        }
+
+        var remembered = new List<string>();
+        foreach (var value in rememberedValues)
+        {
+            AddValidationKey(remembered, value);
+        }
+
+        return remembered.Take(1).ToList();
+    }
+
+    internal static IReadOnlyList<string> ExtractValidationKeys(string? text)
     {
         if (string.IsNullOrWhiteSpace(text))
+        {
+            return [];
+        }
+
+        var keys = new List<string>();
+        foreach (Match match in QueryValidationKeyRegex.Matches(text))
+        {
+            var rawValue = match.Groups[1].Value;
+            try
+            {
+                rawValue = Uri.UnescapeDataString(rawValue);
+            }
+            catch (UriFormatException)
+            {
+            }
+
+            AddValidationKey(keys, rawValue);
+        }
+
+        foreach (var candidateText in new[] { text, text.Replace("\\\"", "\"", StringComparison.Ordinal) })
+        {
+            foreach (Match match in JsonValidationKeyRegex.Matches(candidateText))
+            {
+                AddValidationKey(keys, match.Groups[1].Value);
+            }
+        }
+
+        return keys;
+    }
+
+    private static void AddValidationKey(ICollection<string> keys, string? value)
+    {
+        var normalized = NormalizeValidationKey(value);
+        if (normalized is not null && !keys.Contains(normalized, StringComparer.Ordinal))
+        {
+            keys.Add(normalized);
+        }
+    }
+
+    private static string? NormalizeValidationKey(string? value)
+    {
+        var normalized = value?.Trim();
+        if (string.IsNullOrWhiteSpace(normalized) ||
+            normalized.Equals("undefined", StringComparison.OrdinalIgnoreCase) ||
+            normalized.Equals("null", StringComparison.OrdinalIgnoreCase) ||
+            !ValidationKeyValueRegex.IsMatch(normalized))
         {
             return null;
         }
 
-        var match = ValidationKeyRegex.Match(text);
-        return match.Success ? match.Groups[1].Value : null;
+        return normalized;
     }
 
     private static string? ReadString(JsonElement? element, string name)
@@ -327,9 +519,23 @@ public sealed class O2LoginForm : Form
             : null;
     }
 
-    private static string? FirstNonEmpty(params string?[] values)
+    private static IReadOnlyList<string> ReadStringArray(JsonElement? element, string name)
     {
-        return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))?.Trim();
+        if (element is null ||
+            element.Value.ValueKind != JsonValueKind.Object ||
+            !element.Value.TryGetProperty(name, out var property) ||
+            property.ValueKind != JsonValueKind.Array)
+        {
+            return [];
+        }
+
+        return property
+            .EnumerateArray()
+            .Where(item => item.ValueKind == JsonValueKind.String)
+            .Select(item => item.GetString())
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(value => value!)
+            .ToList();
     }
 
     private const string CaptureScript = """
@@ -344,24 +550,74 @@ public sealed class O2LoginForm : Form
             } catch (_) {}
             return out;
           };
+          const validationKeys = [];
+          const addValidationKey = (value) => {
+            if (typeof value !== 'string') return;
+            let normalized = value.trim();
+            try { normalized = decodeURIComponent(normalized); } catch (_) {}
+            if (!/^[A-Za-z0-9._-]{8,}$/.test(normalized)) return;
+            if (/^(undefined|null)$/i.test(normalized)) return;
+            if (!validationKeys.includes(normalized)) validationKeys.push(normalized);
+          };
+          const scanText = (value) => {
+            if (typeof value !== 'string' || !value) return;
+            try {
+              const url = new URL(value, location.href);
+              addValidationKey(url.searchParams.get('validationkey'));
+            } catch (_) {}
+            const queryMatch = value.match(/(?:^|[?&])validationkey=([^&#\s"']+)/i);
+            if (queryMatch) addValidationKey(queryMatch[1]);
+            const normalizedJson = value.replace(/\\"/g, '"');
+            const propertyMatch = normalizedJson.match(/"validationkey"\s*:\s*"([A-Za-z0-9._-]{8,})"/i);
+            if (propertyMatch) addValidationKey(propertyMatch[1]);
+          };
+          const scanValue = (value, depth = 0) => {
+            if (depth > 3 || value == null) return;
+            if (typeof value === 'string') {
+              scanText(value);
+              const trimmed = value.trim();
+              if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+                try { scanValue(JSON.parse(trimmed), depth + 1); } catch (_) {}
+              }
+              return;
+            }
+            if (Array.isArray(value)) {
+              for (const child of value) scanValue(child, depth + 1);
+              return;
+            }
+            if (typeof value === 'object') {
+              for (const [key, child] of Object.entries(value)) {
+                if (key.toLowerCase() === 'validationkey') addValidationKey(child);
+              }
+              for (const child of Object.values(value)) scanValue(child, depth + 1);
+            }
+          };
           const resources = [];
           try {
             for (const entry of performance.getEntriesByType('resource')) {
               if (entry && entry.name) resources.push(entry.name);
             }
           } catch (_) {}
+          const seenUrls = Array.isArray(window.__o2CloudDriveSeenUrls)
+            ? window.__o2CloudDriveSeenUrls.slice(-100)
+            : [];
+          const localState = readStorage(localStorage);
+          const sessionState = readStorage(sessionStorage);
+          scanValue(seenUrls.slice().reverse());
+          scanValue(resources.slice(-100).reverse());
+          scanValue(sessionState);
+          scanValue(localState);
+          scanText(location.href);
           const payload = {
             url: location.href,
-            cookie: document.cookie || '',
             userAgent: navigator.userAgent || '',
-            localStorage: readStorage(localStorage),
-            sessionStorage: readStorage(sessionStorage),
-            seenUrls: Array.isArray(window.__o2CloudDriveSeenUrls) ? window.__o2CloudDriveSeenUrls.slice(-100) : [],
-            resources: resources.slice(-100)
+            localStorage: localState,
+            sessionStorage: sessionState,
+            seenUrls,
+            resources: resources.slice(-100),
+            validationKeys,
+            validationKey: validationKeys[0] || ''
           };
-          const text = JSON.stringify(payload);
-          const match = text.match(/validationkey[^A-Za-z0-9._-]+([A-Za-z0-9._-]{8,})/i);
-          payload.validationKey = match ? match[1] : '';
           return payload;
         })();
         """;

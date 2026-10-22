@@ -1,4 +1,5 @@
 using O2CloudDrive.Api;
+using O2CloudDrive.Auth;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -613,6 +614,10 @@ public sealed class O2CloudFileStore : ICloudFileStore
         {
             items = _apiClient.ListFolder(directory.Id);
         }
+        catch (O2AuthenticationException)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             LoadListingError(directory, ex);
@@ -810,6 +815,10 @@ public sealed class O2CloudFileStore : ICloudFileStore
         try
         {
             items = _apiClient.ListTrash();
+        }
+        catch (O2AuthenticationException)
+        {
+            throw;
         }
         catch (Exception ex)
         {

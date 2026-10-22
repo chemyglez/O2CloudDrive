@@ -73,9 +73,9 @@ public sealed partial class UpdateService
             }
 
             var installerAsset = latest.Release.Assets?
-                .FirstOrDefault(asset =>
-                    asset.Name.EndsWith("-Setup.exe", StringComparison.OrdinalIgnoreCase) ||
-                    asset.Name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase));
+                .FirstOrDefault(asset => asset.Name.EndsWith("-Setup.exe", StringComparison.OrdinalIgnoreCase))
+                ?? latest.Release.Assets?
+                    .FirstOrDefault(asset => asset.Name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase));
 
             var update = new UpdateRelease(
                 latest.Release.TagName,

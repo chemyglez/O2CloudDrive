@@ -117,11 +117,7 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         });
 
         var root = document.RootElement;
-        var data = ObjectProperty(root, "data");
-        var folders = ArrayProperty(data, "folders");
-        var folder = folders.Count > 0
-            ? folders[0]
-            : FirstObjectProperty(root, "rootfolder", "rootFolder", "folder") ?? root;
+        var folder = RootFolderElement(root);
 
         var folderIdCandidates = FolderIdCandidates(folder);
         var id = folderIdCandidates.FirstOrDefault();
@@ -744,7 +740,7 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
     {
         var uri = NormalizeDownloadUri(rawUrl, fileName);
         using var request = new HttpRequestMessage(HttpMethod.Get, uri);
-        ApplySessionHeaders(request);
+        ApplySessionHeaders(request, includeCookies: O2SessionRequest.IsSameOrigin(uri, _baseUri));
         request.Headers.TryAddWithoutValidation("Accept", "*/*");
         request.Headers.Range = new RangeHeaderValue((long)offset, checked((long)(offset + length - 1)));
 
@@ -774,7 +770,7 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         {
             var uri = NormalizeDownloadUri(rawUrl, fileName);
             using var request = new HttpRequestMessage(HttpMethod.Get, uri);
-            ApplySessionHeaders(request);
+            ApplySessionHeaders(request, includeCookies: O2SessionRequest.IsSameOrigin(uri, _baseUri));
             request.Headers.TryAddWithoutValidation("Accept", "*/*");
             request.Headers.Range = new RangeHeaderValue(0, 1023);
 
@@ -911,8 +907,9 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         };
 
         var useAsyncUpload = contentLength > AsyncUploadThresholdBytes;
-        using var request = new HttpRequestMessage(HttpMethod.Post, BuildUploadUri(useAsyncUpload));
-        ApplySessionHeaders(request);
+        var session = _authService.GetCurrentSession();
+        using var request = new HttpRequestMessage(HttpMethod.Post, BuildUploadUri(useAsyncUpload, session));
+        O2SessionRequest.ApplyHeaders(request, _baseUri, session);
         request.Headers.TryAddWithoutValidation("X-deviceid", "O2CloudDrive");
         request.Headers.TryAddWithoutValidation("X-Requested-With", "XMLHttpRequest");
         request.Headers.TryAddWithoutValidation("Origin", _baseUri.GetLeftPart(UriPartial.Authority));
@@ -964,7 +961,13 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         using var response = SendUploadRequest(request, uploadCancellation.Token);
         stallTimer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
         var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-        if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+        if (response.StatusCode == HttpStatusCode.Unauthorized)
+        {
+            _authService.InvalidateSessionIfCurrent(session);
+            throw new O2AuthenticationException(response.StatusCode, "upload");
+        }
+
+        if (response.StatusCode == HttpStatusCode.Forbidden)
         {
             throw new UnauthorizedAccessException("O2 Cloud rechazo la subida porque la sesion no esta autorizada.");
         }
@@ -999,6 +1002,11 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         try
         {
             document = ParseOptionalJson(text);
+            if (document is not null)
+            {
+                ThrowIfAuthenticationRejected(document.RootElement, "upload", session);
+                ThrowIfO2Error(document.RootElement, text);
+            }
         }
         catch (JsonException ex)
         {
@@ -2074,18 +2082,19 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         IReadOnlyDictionary<string, string?> query,
         object? body = null)
     {
-        using var request = new HttpRequestMessage(method, BuildAuthenticatedUri(resource, query));
-        ApplySessionHeaders(request);
-        request.Headers.TryAddWithoutValidation("Accept", "application/json");
+        var session = _authService.GetCurrentSession();
+        using var request = O2SessionRequest.Create(method, _baseUri, resource, query, session);
         if (body is not null)
         {
             request.Content = new StringContent(JsonSerializer.Serialize(body, JsonOptions), Encoding.UTF8, "application/json");
         }
 
         using var response = _httpClient.Send(request);
+        ThrowIfAuthenticationRejected(response, resource, session);
         response.EnsureSuccessStatusCode();
         var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
         var document = ParseJson(text);
+        ThrowIfAuthenticationRejected(document.RootElement, resource, session);
         ThrowIfO2Error(document.RootElement, text);
         return document;
     }
@@ -2096,40 +2105,33 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         IReadOnlyDictionary<string, string?> query,
         object body)
     {
-        using var request = new HttpRequestMessage(method, BuildAuthenticatedUri(resource, query));
-        ApplySessionHeaders(request);
-        request.Headers.TryAddWithoutValidation("Accept", "application/json");
+        var session = _authService.GetCurrentSession();
+        using var request = O2SessionRequest.Create(method, _baseUri, resource, query, session);
         request.Content = new FormUrlEncodedContent([
             new KeyValuePair<string, string>("data", JsonSerializer.Serialize(body, JsonOptions)),
         ]);
 
         using var response = _httpClient.Send(request);
+        ThrowIfAuthenticationRejected(response, resource, session);
         response.EnsureSuccessStatusCode();
         var text = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-        return ParseOptionalJson(text);
+        var document = ParseOptionalJson(text);
+        if (document is not null)
+        {
+            ThrowIfAuthenticationRejected(document.RootElement, resource, session);
+            ThrowIfO2Error(document.RootElement, text);
+        }
+
+        return document;
     }
 
     private Uri BuildAuthenticatedUri(string resource, IReadOnlyDictionary<string, string?> query)
     {
-        var session = _authService.GetCurrentSession();
-        var builder = new UriBuilder(new Uri(_baseUri, resource.TrimStart('/')));
-        var parameters = query
-            .Where(pair => !string.IsNullOrWhiteSpace(pair.Value))
-            .Select(pair => $"{Uri.EscapeDataString(pair.Key)}={Uri.EscapeDataString(pair.Value!)}")
-            .ToList();
-
-        if (session.IsAuthenticated)
-        {
-            parameters.Add($"validationkey={Uri.EscapeDataString(session.ValidationKey)}");
-        }
-
-        builder.Query = string.Join("&", parameters);
-        return builder.Uri;
+        return O2SessionRequest.BuildUri(_baseUri, resource, query, _authService.GetCurrentSession());
     }
 
-    private Uri BuildUploadUri(bool acceptAsynchronous)
+    private static Uri BuildUploadUri(bool acceptAsynchronous, O2Session session)
     {
-        var session = _authService.GetCurrentSession();
         var parameters = new List<string> { "action=save" };
         if (session.IsAuthenticated)
         {
@@ -2148,21 +2150,37 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         return builder.Uri;
     }
 
-    private void ApplySessionHeaders(HttpRequestMessage request)
+    private void ApplySessionHeaders(HttpRequestMessage request, bool includeCookies = true)
     {
-        var session = _authService.GetCurrentSession();
-        if (!string.IsNullOrWhiteSpace(session.CookieHeader))
+        O2SessionRequest.ApplyHeaders(request, _baseUri, _authService.GetCurrentSession(), includeCookies);
+    }
+
+    private void ThrowIfAuthenticationRejected(
+        HttpResponseMessage response,
+        string resource,
+        O2Session expectedSession)
+    {
+        if (response.StatusCode != HttpStatusCode.Unauthorized)
         {
-            request.Headers.TryAddWithoutValidation("Cookie", session.CookieHeader);
+            return;
         }
 
-        request.Headers.TryAddWithoutValidation(
-            "User-Agent",
-            string.IsNullOrWhiteSpace(session.UserAgent) ? "O2CloudDrive/0.1" : session.UserAgent);
-        request.Headers.TryAddWithoutValidation("Origin", _baseUri.GetLeftPart(UriPartial.Authority));
-        request.Headers.TryAddWithoutValidation("Referer", _baseUri.GetLeftPart(UriPartial.Authority) + "/");
-        request.Headers.TryAddWithoutValidation("Accept-Language", "es-ES,es;q=0.9,en;q=0.8");
-        request.Headers.TryAddWithoutValidation("X-deviceid", "O2CloudDrive");
+        _authService.InvalidateSessionIfCurrent(expectedSession);
+        throw new O2AuthenticationException(response.StatusCode, resource);
+    }
+
+    private void ThrowIfAuthenticationRejected(
+        JsonElement root,
+        string resource,
+        O2Session expectedSession)
+    {
+        if (!HasAuthenticationError(root))
+        {
+            return;
+        }
+
+        _authService.InvalidateSessionIfCurrent(expectedSession);
+        throw new O2AuthenticationException(HttpStatusCode.Unauthorized, resource);
     }
 
     private string NormalizeShareLink(string rawUrl)
@@ -2334,9 +2352,7 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             return null;
         }
 
-        var document = ParseJson(trimmed);
-        ThrowIfO2Error(document.RootElement, trimmed);
-        return document;
+        return ParseJson(trimmed);
     }
 
     private static bool IsUploadAccepted(JsonDocument? document, string rawText)
@@ -2422,7 +2438,7 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         return id.StartsWith(PendingUploadIdPrefix, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static JsonDocument ParseJson(string text)
+    internal static JsonDocument ParseJson(string text)
     {
         var trimmed = text.Trim();
         try
@@ -2669,6 +2685,20 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             .Select(value => value!)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
+    }
+
+    internal static bool HasRootFolder(JsonElement root)
+    {
+        return FolderIdCandidates(RootFolderElement(root)).Count > 0;
+    }
+
+    private static JsonElement RootFolderElement(JsonElement root)
+    {
+        var data = ObjectProperty(root, "data");
+        var folders = ArrayProperty(data, "folders");
+        return folders.Count > 0
+            ? folders[0]
+            : FirstObjectProperty(root, "rootfolder", "rootFolder", "folder") ?? root;
     }
 
     private static IReadOnlyList<string> MediaIdCandidates(JsonElement element)
@@ -3056,7 +3086,7 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             : id;
     }
 
-    private static void ThrowIfO2Error(JsonElement root, string rawText)
+    internal static void ThrowIfO2Error(JsonElement root, string rawText)
     {
         if (root.ValueKind != JsonValueKind.Object)
         {
@@ -3081,6 +3111,68 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
         {
             throw new InvalidOperationException($"O2 Cloud rechazo la operacion: {TrimPreview(rawText)}");
         }
+    }
+
+    internal static bool HasAuthenticationError(JsonElement root)
+    {
+        if (root.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        var authenticated = FirstString(root, "authenticated", "isAuthenticated", "isauthenticated");
+        if (authenticated is not null && authenticated.Equals("false", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var code = FirstString(root, "code", "errorcode", "statuscode")?.Trim();
+        if (IsAuthenticationCode(code))
+        {
+            return true;
+        }
+
+        string? errorText = null;
+        if (root.TryGetProperty("error", out var error))
+        {
+            errorText = error.ToString();
+            if (error.ValueKind == JsonValueKind.Object)
+            {
+                var errorCode = FirstString(error, "code", "errorcode", "statuscode")?.Trim();
+                var errorMessage = FirstString(error, "message", "description", "detail");
+                if (IsAuthenticationCode(errorCode) || IsAuthenticationFailureText(errorMessage))
+                {
+                    return true;
+                }
+            }
+        }
+
+        var statusText = FirstString(root, "status");
+        var messageText = FirstString(root, "message", "description", "detail");
+        return IsAuthenticationFailureText(errorText) ||
+               IsAuthenticationFailureText(statusText) ||
+               IsAuthenticationFailureText(messageText);
+    }
+
+    private static bool IsAuthenticationCode(string? code)
+    {
+        return code is not null &&
+               (code.Equals("401", StringComparison.OrdinalIgnoreCase) ||
+                code.EndsWith("-401", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsAuthenticationFailureText(string? text)
+    {
+        return !string.IsNullOrWhiteSpace(text) &&
+               (text.Contains("unauthorized", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("unauthenticated", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("authentication required", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("not authenticated", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("invalid session", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("session expired", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("expired session", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("invalid validationkey", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("invalid validation key", StringComparison.OrdinalIgnoreCase));
     }
 
     private static bool IsMeaningfulError(JsonElement error)
@@ -3207,6 +3299,10 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             {
                 return operation();
             }
+            catch (O2AuthenticationException)
+            {
+                throw;
+            }
             catch (Exception ex)
             {
                 lastError = ex;
@@ -3225,6 +3321,10 @@ public sealed class O2CloudApiClient : IO2CloudApiClient
             {
                 operation();
                 return;
+            }
+            catch (O2AuthenticationException)
+            {
+                throw;
             }
             catch (Exception ex)
             {

@@ -1,5 +1,6 @@
 using Fsp;
 using O2CloudDrive.Api;
+using O2CloudDrive.Auth;
 using O2CloudDrive.VirtualFileSystem;
 
 namespace O2CloudDrive.Mounting;
@@ -194,6 +195,10 @@ public sealed class O2DriveMountService : IDisposable
             }
 
             return children.Count;
+        }
+        catch (O2AuthenticationException)
+        {
+            throw;
         }
         catch
         {

@@ -9,6 +9,10 @@
     <UseWindowsForms>true</UseWindowsForms>
     <AssemblyName>O2CloudDrive</AssemblyName>
     <RootNamespace>O2CloudDrive</RootNamespace>
+    <Version>0.8.5</Version>
+    <AssemblyVersion>0.8.5.0</AssemblyVersion>
+    <FileVersion>0.8.5.0</FileVersion>
+    <InformationalVersion>0.8.5-beta</InformationalVersion>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <ApplicationIcon>Assets\O2CloudDrive.ico</ApplicationIcon>
   </PropertyGroup>
@@ -21,5 +25,9 @@
   <ItemGroup>
     <None Update="appsettings.json" CopyToOutputDirectory="PreserveNewest" />
     <None Update="Assets\O2CloudDrive.ico" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="O2CloudDrive.Tests" />
   </ItemGroup>
 </Project>
