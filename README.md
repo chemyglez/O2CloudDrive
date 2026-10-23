@@ -37,18 +37,6 @@ Tambien se publican variantes para actualizar equipos que ya tienen las dependen
 - `O2CloudDrive-0.8.7-beta-Update.exe`: actualizacion sin WinFsp ni WebView2 embebidos. La app sigue siendo autocontenida, por lo que no requiere instalar .NET.
 - `O2CloudDrive-0.8.7-beta-Update-Net8.exe`: actualizacion sin WinFsp, WebView2 ni runtime .NET embebido. Requiere Microsoft .NET 8 Desktop Runtime instalado.
 
-## Correccion de login y rotacion de sesion en 0.8.6 beta
-
-Corrige el caso en el que O2 ya mostraba los archivos, pero la ventana permanecia en `Sesion detectada, esperando a que O2 termine de validarla`. La consulta de la carpeta raiz usa el metodo `GET` que espera O2 y las peticiones normales no envian un `X-deviceid` fijo. La aplicacion obtiene la `validationkey` actual de la respuesta o de la cookie, admite tambien el alias `validation_key` y propaga cada renovacion a la sesion usada por el montaje. Las claves antiguas y las respuestas que terminan fuera de orden ya no desplazan a la clave actual.
-
-## Correccion de sobrescritura y rendimiento en 0.8.7 beta
-
-Al guardar cambios sobre un archivo existente, la aplicacion sustituye el objeto remoto mediante una operacion confirmada por identificador, nombre y tamano. La nueva version se sube con un nombre temporal unico, el objeto anterior se aparta de forma reversible y solo entonces se asigna el nombre definitivo al nuevo objeto. Se consulta el tamano remoto anterior antes de sustituirlo, aunque la copia local ya tenga otro tamano. Si falla antes de confirmar el cambio, se intenta restaurar el objeto anterior; cualquier fallo de restauracion se notifica y la copia local se conserva junto a sus datos de recuperacion. Las escrituras y los renombrados del mismo archivo esperan a que termine la subida en curso, y `Flush` no informa de exito hasta recibir la confirmacion remota.
-
-## Correccion de sesion en 0.8.5 beta
-
-La ventana de login solo guarda la sesion cuando O2 acepta la misma consulta de carpeta raiz que utiliza el montaje. La captura espera a que WebView2 consolide la clave y las cookies, incluye las cookies aplicables a `/sapi/` y rechaza respuestas incompletas. Si O2 invalida la sesion entre la validacion y el montaje, la aplicacion elimina la credencial rechazada y permite un unico login nuevo.
-
 ## Actualizaciones
 
 La aplicacion puede comprobar automaticamente las releases publicadas en GitHub al iniciar. Si hay una version nueva, muestra una notificacion y una ventana con enlace de descarga del instalador.
